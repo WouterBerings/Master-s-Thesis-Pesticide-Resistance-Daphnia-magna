@@ -1,0 +1,137 @@
+
+#############################################
+# R SCRIPT (GWAS_plots.R)
+#############################################
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(qqman)
+})
+
+# -----------------------------
+# User parameters
+# -----------------------------
+assoc_file <- "gemma_results/resultssubset5mostand5least.assoc.txt"
+pval_col   <- "p_lrt"
+plot_dir   <- "plots"
+
+if(!file.exists(assoc_file)){
+  stop("Input file not found: ", assoc_file)
+}
+
+if(!dir.exists(plot_dir)) dir.create(plot_dir)
+
+manhattan_out <- file.path(plot_dir, "manhattan subset5.png")
+qq_out        <- file.path(plot_dir, "qqplot subset5.png")
+lambda_file   <- file.path(plot_dir, "lambda subset 5.txt")
+thresholds_file <- file.path(plot_dir, "subset 5.txt")
+
+# -----------------------------
+# Load data
+# -----------------------------
+gwas <- fread(assoc_file)
+
+required_cols <- c("chr", "ps", pval_col)
+if(!all(required_cols %in% colnames(gwas))){
+  stop("Missing required columns: ", paste(required_cols, collapse=", "))
+}
+
+# -----------------------------
+# Prepare data
+# -----------------------------
+gwas_df <- data.frame(
+  SNP = paste0(gwas$chr, "_", gwas$ps),
+  CHR = as.character(gwas$chr),
+  BP  = gwas$ps,
+  P   = gwas[[pval_col]]
+)
+
+# Clean p-values
+gwas_df <- gwas_df[!is.na(gwas_df$P) & gwas_df$P > 0 & gwas_df$P <= 1, ]
+
+if(nrow(gwas_df) == 0){
+  stop("No valid p-values after filtering")
+}
+
+# -----------------------------
+# Chromosome handling
+# -----------------------------
+# Convert to character first
+gwas_df$CHR <- as.character(gwas_df$CHR)
+
+# Get unique chromosomes in sorted order
+unique_chr <- sort(unique(gwas_df$CHR))
+
+# Map them to 1..N (e.g., 1..10)
+chr_map <- setNames(seq_along(unique_chr), unique_chr)
+
+# Apply mapping
+gwas_df$CHR <- chr_map[gwas_df$CHR]
+
+# Convert to numeric
+gwas_df$CHR <- as.numeric(gwas_df$CHR)
+# -----------------------------
+# Multiple testing thresholds
+# -----------------------------
+n_tests <- nrow(gwas_df)
+
+bonferroni_threshold <- 0.05 / n_tests
+fdr_values <- p.adjust(gwas_df$P, method = "fdr")
+
+# Save thresholds
+write.table(
+  data.frame(
+    n_tests = n_tests,
+    bonferroni = bonferroni_threshold,
+    bonferroni_log10 = -log10(bonferroni_threshold)
+  ),
+  thresholds_file,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# -----------------------------
+# Manhattan plot
+# -----------------------------
+png(manhattan_out, width=1400, height=700)
+manhattan(
+  gwas_df,
+  main = "GWAS Manhattan Plot",
+  col = c("blue4", "orange3"),
+  suggestiveline = -log10(1e-5),
+  genomewideline = -log10(bonferroni_threshold)
+)
+dev.off()
+
+cat("Manhattan plot saved to:", manhattan_out, "\n")
+
+# -----------------------------
+# QQ plot
+# -----------------------------
+png(qq_out, width=600, height=600)
+qq(gwas_df$P, main="QQ Plot of GWAS P-values")
+dev.off()
+
+cat("QQ plot saved to:", qq_out, "\n")
+
+# -----------------------------
+# Lambda calculation
+# -----------------------------
+chisq <- qchisq(1 - gwas_df$P, df = 1)
+lambda <- median(chisq) / qchisq(0.5, 1)
+
+write(lambda, file=lambda_file)
+
+cat("Lambda:", lambda, "\n")
+cat("Lambda written to:", lambda_file, "\n")
+
+# -----------------------------
+# Significant hits reporting
+# -----------------------------
+sig_bonf <- gwas_df[gwas_df$P < bonferroni_threshold, ]
+sig_fdr  <- gwas_df[fdr_values < 0.05, ]
+
+cat("\nSignificant SNPs:\n")
+cat("Bonferroni:", nrow(sig_bonf), "\n")
+cat("FDR < 0.05:", nrow(sig_fdr), "\n")
