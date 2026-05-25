@@ -1,0 +1,227 @@
+#!/bin/bash -l
+set -euo pipefail
+
+#########################
+# SLURM CONFIG
+#########################
+#SBATCH --job-name=gwas_merged_nocov
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=20
+#SBATCH --time=72:00:00
+#SBATCH -A lp_
+#SBATCH -o gwas_merged_nocov.%j.out
+#SBATCH -e gwas_merged_nocov.%j.err
+
+#########################
+# ENVIRONMENT SETUP
+#########################
+module purge
+module load cluster/wice/batch
+module load BCFtools/1.15.1-GCC-11.3.0
+module load PLINK/2.0.0-a.6.9-gfbf-2024a
+
+# GEMMA environment
+source /data/leuven/385/vsc38531/miniconda3/etc/profile.d/conda.sh
+conda activate gemma || { echo "ERROR: conda activate failed"; exit 1; }
+
+#########################
+# INPUTS
+#########################
+VCF1="Merged_clean.vcf.gz"
+VCF_CLEAN="clean_Merged_clean.vcf.gz"
+PHENO_FILE="blup_output.txt"
+PHENO_COL="Phenotype"
+THREADS=20
+
+#########################
+# CHECK INPUTS
+#########################
+[ -f "$VCF1" ] || { echo "ERROR: VCF file not found"; exit 1; }
+[ -f "$PHENO_FILE" ] || { echo "ERROR: Phenotype file not found"; exit 1; }
+
+mkdir -p logs kinship_matrix gemma_results
+
+echo "[INFO] Starting job at $(date)"
+
+#########################
+# 0) CLEAN SAMPLE NAMES
+#########################
+if [ ! -f "$VCF_CLEAN" ]; then
+  echo "[INFO] Reheadering VCF..."
+
+  bcftools view -h "$VCF1" | awk '
+  BEGIN {OFS="\t"}
+  /^#CHROM/ {
+    for (i=10; i<=NF; i++) {
+      gsub("_", "", $i)
+    }
+  }
+  {print}
+  ' > new_header.txt
+
+  bcftools reheader -h new_header.txt -o "$VCF_CLEAN" "$VCF1"
+
+  # ? WICE-compatible indexing (replaces tabix)
+  bcftools index -t "$VCF_CLEAN"
+fi
+
+#########################
+# DEBUG: SAMPLE NAMES
+#########################
+echo "[DEBUG] First VCF samples:"
+bcftools query -l "$VCF_CLEAN" | head
+
+echo "[DEBUG] Phenotype header:"
+head -n 1 "$PHENO_FILE"
+
+#########################
+# 1) CONVERT VCF ? PLINK
+#########################
+if [ ! -f merged_base.bed ]; then
+  echo "[INFO] Converting VCF to PLINK..."
+  plink \
+    --vcf "$VCF_CLEAN" \
+    --allow-extra-chr \
+    --allow-no-sex \
+    --threads $THREADS \
+    --make-bed \
+    --out merged_base \
+    > logs/step1_plink.log 2>&1
+fi
+
+#########################
+# 2) BUILD KEEP FILE
+#########################
+echo "[INFO] Building keep file..."
+
+awk -v phcol="$PHENO_COL" '
+BEGIN{FS="[ \t]+"; OFS="\t"}
+NR==1{
+  for(i=1;i<=NF;i++){
+    if($i=="FID") f=i
+    if($i=="IID") id=i
+    if($i==phcol) p=i
+  }
+  if(!f || !id || !p){
+    print "ERROR: Phenotype file must have FID, IID, and " phcol " headers." > "/dev/stderr"; exit 1
+  }
+  next
+}
+{
+  val=$p
+  gsub(/^[ \t]+|[ \t]+$/, "", val)
+  if(val!="" && val!="NA" && val!="-9") print $f, $id
+}
+' "$PHENO_FILE" > keep_phenotyped.txt
+
+[ -s keep_phenotyped.txt ] || { echo "ERROR: No valid phenotypes"; exit 1; }
+
+#########################
+# 2b) CHECK SAMPLE MATCHING
+#########################
+echo "[INFO] Checking sample overlap..."
+
+bcftools query -l "$VCF_CLEAN" | sort > vcf_samples.txt
+awk '{print $1}' "$PHENO_FILE" | tail -n +2 | sort > pheno_samples.txt
+
+comm -23 pheno_samples.txt vcf_samples.txt > missing_in_vcf.txt
+comm -13 pheno_samples.txt vcf_samples.txt > missing_in_pheno.txt
+
+echo "[INFO] Samples in phenotype but not in VCF:"
+wc -l missing_in_vcf.txt
+
+echo "[INFO] Samples in VCF but not in phenotype:"
+wc -l missing_in_pheno.txt
+
+#########################
+# 3) SUBSET + ADD PHENO
+#########################
+echo "[INFO] Subsetting PLINK..."
+
+plink \
+  --bfile merged_base \
+  --keep keep_phenotyped.txt \
+  --threads $THREADS \
+  --make-bed \
+  --allow-extra-chr \
+  --allow-no-sex \
+  --out merged_pheno_subset \
+  > logs/step3_keep.log 2>&1
+
+plink \
+  --bfile merged_pheno_subset \
+  --pheno "$PHENO_FILE" \
+  --pheno-name "$PHENO_COL" \
+  --threads $THREADS \
+  --make-bed \
+  --allow-extra-chr \
+  --allow-no-sex \
+  --out gwas_input_merged \
+  > logs/step3b_pheno.log 2>&1
+
+#########################
+# 4) MISSINGNESS
+#########################
+plink \
+  --bfile gwas_input_merged \
+  --missing \
+  --threads $THREADS \
+  --allow-extra-chr \
+  --allow-no-sex \
+  --out missing_check \
+  > logs/step4_missing.log 2>&1
+
+#########################
+# 5) OPTIONAL QC
+#########################
+APPLY_QC=false
+MIND=0.10
+GENO=0.05
+MAF=0.01
+
+QC_PREFIX="gwas_input_merged"
+
+if [ "$APPLY_QC" = true ]; then
+  echo "[INFO] Running QC..."
+
+  plink \
+    --bfile gwas_input_merged \
+    --mind $MIND \
+    --geno $GENO \
+    --maf $MAF \
+    --threads $THREADS \
+    --allow-extra-chr \
+    --allow-no-sex \
+    --make-bed \
+    --out gwas_input_merged_qc \
+    > logs/step5_qc.log 2>&1
+
+  QC_PREFIX="gwas_input_merged_qc"
+fi
+
+#########################
+# 6) KINSHIP
+#########################
+echo "[INFO] Computing kinship..."
+
+gemma \
+  -bfile "$QC_PREFIX" \
+  -gk 1 \
+  -outdir kinship_matrix \
+  -o "$QC_PREFIX" \
+  > logs/step6_gemma_gk.log 2>&1
+
+#########################
+# 7) GWAS
+#########################
+echo "[INFO] Running GWAS..."
+
+gemma \
+  -bfile "$QC_PREFIX" \
+  -k "kinship_matrix/${QC_PREFIX}.cXX.txt" \
+  -lmm 4 \
+  -outdir gemma_results \
+  -o "gwas_results" \
+  > logs/step7_gemma_lmm.log 2>&1
+
+echo "[INFO] DONE at $(date)"
