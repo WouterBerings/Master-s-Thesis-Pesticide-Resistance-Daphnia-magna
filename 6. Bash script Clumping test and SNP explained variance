@@ -1,0 +1,59 @@
+##LD check PLNK
+
+module load PLINK
+
+# plink --bfile your_data --ld-snp-list top_snps.txt --ld-window-kb 500 --r2
+
+# Step 1: assign unique IDs based on chr:position
+plink --bfile gwas_input \
+      --set-missing-var-ids @:# \
+      --allow-extra-chr \
+      --make-bed \
+      --out gwas_input_ids
+
+# In PLINK — clump around top hit, r²>0.1 within 500kb = same signal
+plink --bfile gwas_input_ids \
+      --clump results_ids.assoc.txt \
+      --clump-field p_wald \
+      --clump-snp-field snp_id \
+      --clump-p1 5e-8 \
+      --clump-kb 500 \
+      --clump-r2 0.1 \
+      --allow-extra-chr \
+      --out clumped_results
+
+cat clumped_results.clumped
+
+awk '$1=="CM058177.1" && $4>=1144202 && $5<=1212012 && $3=="gene"' \
+    GCA_030254905.1_UOB_LRV0_1_genomic.gff
+
+# All feature types in the region (not just genes)
+awk '$1=="CM058177.1" && $4>=1144202 && $5<=1212012' \
+    GCA_030254905.1_UOB_LRV0_1_genomic.gff | cut -f3 | sort | uniq
+
+# Full annotation of the region
+awk '$1=="CM058177.1" && $4>=1144202 && $5<=1212012' \
+    GCA_030254905.1_UOB_LRV0_1_genomic.gff > region_genes.gff
+
+cat region_genes.gff
+
+
+#For r2 between top SNPs
+plink --vcf clean_Merged_clean.vcf.gz \
+      --allow-extra-chr \
+      --chr scaffold_5 \
+      --from-bp 1194000 \
+      --to-bp 1210000 \
+      --r2 square \
+      --threads 1 \
+      --out scaffold5_LD
+
+# Get the positions of all SNPs in the LD output, in order
+plink --vcf clean_Merged_clean.vcf.gz \
+      --allow-extra-chr \
+      --chr scaffold_5 \
+      --from-bp 1194000 \
+      --to-bp 1210000 \
+      --threads 1 \
+      --make-just-bim \
+      --out scaffold5_LD
