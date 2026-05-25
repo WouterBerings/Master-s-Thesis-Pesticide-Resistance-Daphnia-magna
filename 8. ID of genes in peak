@@ -1,0 +1,272 @@
+#!/bin/bash -l
+set -euo pipefail
+
+########################################
+# SLURM CONFIG
+########################################
+#SBATCH --job-name=annotate_peak
+#SBATCH --constraint=cascadelake
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=02:00:00
+#SBATCH -A lp_
+#SBATCH -o logs/%x.%j.out
+#SBATCH -e logs/%x.%j.err
+
+########################################
+# LOGGING
+########################################
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+die() { echo "[ERROR] $*" >&2; exit 1; }
+
+########################################
+# SCAFFOLD -> GFF ACCESSION MAPPING
+# (from GCA_030254905.1_UOB_LRV0_1_assembly_report.txt)
+########################################
+declare -A SCAFFOLD_TO_GFF
+SCAFFOLD_TO_GFF["scaffold_2"]="CM058171.1"   # LG1
+SCAFFOLD_TO_GFF["scaffold_1"]="CM058172.1"   # LG2
+SCAFFOLD_TO_GFF["scaffold_3"]="CM058173.1"   # LG3
+SCAFFOLD_TO_GFF["scaffold_6"]="CM058174.1"   # LG4
+SCAFFOLD_TO_GFF["scaffold_4"]="CM058175.1"   # LG5
+SCAFFOLD_TO_GFF["scaffold_10"]="CM058176.1"  # LG6
+SCAFFOLD_TO_GFF["scaffold_5"]="CM058177.1"   # LG7  <-- peak
+SCAFFOLD_TO_GFF["scaffold_9"]="CM058178.1"   # LG8
+SCAFFOLD_TO_GFF["scaffold_7"]="CM058179.1"   # LG9
+SCAFFOLD_TO_GFF["scaffold_8"]="CM058180.1"   # LG10
+
+########################################
+# INPUTS EDIT THESE
+########################################
+GWAS_RESULT="gemma_results/results.assoc.txt"
+
+# Peak scaffold (GEMMA name)
+PEAK_CHR="scaffold_5"
+
+# Peak coordinates (from top SNPs: ~1,184,000 - 1,202,000)
+PEAK_START=1184000
+PEAK_END=1202000
+
+# Flanking window around peak for gene search (bp)
+FLANK=50000
+
+# Files
+GFF="GCA_030254905.1_UOB_LRV0_1_genomic.gff.gz"
+GO_CSV="GO.csv"
+OUT_DIR="peak_annotation"
+
+########################################
+# ENVIRONMENT
+########################################
+module purge
+module load cluster/wice/batch
+module load BCFtools/1.15.1-GCC-11.3.0
+
+source /data/leuven/385/vsc38531/miniconda3/etc/profile.d/conda.sh
+conda activate gemma || die "Conda activation failed"
+
+which bedtools &>/dev/null || die "bedtools not found � run: conda install -c bioconda bedtools"
+python3 -c "import pandas" 2>/dev/null || die "pandas not found � run: conda install pandas"
+
+mkdir -p "$OUT_DIR" logs
+
+########################################
+# RESOLVE GFF CHROMOSOME NAME
+########################################
+PEAK_CHR_GFF="${SCAFFOLD_TO_GFF[$PEAK_CHR]:-}"
+[ -n "$PEAK_CHR_GFF" ] || die "No GFF mapping found for $PEAK_CHR"
+log "Peak: $PEAK_CHR (GEMMA) = $PEAK_CHR_GFF (GFF)"
+
+########################################
+# STEP 1: EXTRACT SNPs IN PEAK REGION
+########################################
+log "Extracting SNPs in ${PEAK_CHR}:${PEAK_START}-${PEAK_END}"
+
+awk -v chr="$PEAK_CHR" -v s="$PEAK_START" -v e="$PEAK_END" \
+    'NR==1 || ($1==chr && $3>=s && $3<=e)' \
+    "$GWAS_RESULT" \
+    > "$OUT_DIR/peak_snps_all.txt"
+
+N_SNPS=$(( $(wc -l < "$OUT_DIR/peak_snps_all.txt") - 1 ))
+log "SNPs in region: $N_SNPS"
+[ "$N_SNPS" -gt 0 ] || die "No SNPs found � check PEAK_CHR and coordinates"
+
+# Sort by p_wald (col 13)
+head -1 "$OUT_DIR/peak_snps_all.txt" > "$OUT_DIR/peak_snps_sorted.txt"
+tail -n +2 "$OUT_DIR/peak_snps_all.txt" | sort -k13,13g >> "$OUT_DIR/peak_snps_sorted.txt"
+
+log "Top SNP:"
+sed -n '2p' "$OUT_DIR/peak_snps_sorted.txt" | \
+    awk '{printf "  scaffold=%s  pos=%s  p_wald=%s  beta=%s\n", $1, $3, $13, $8}'
+
+# BED format for bedtools (0-based)
+tail -n +2 "$OUT_DIR/peak_snps_sorted.txt" | \
+    awk 'BEGIN{OFS="\t"} {print $1, $3-1, $3, $3, $13}' \
+    > "$OUT_DIR/peak_snps.bed"
+
+########################################
+# STEP 2: DEFINE SEARCH WINDOW
+########################################
+WINDOW_START=$(( PEAK_START - FLANK ))
+WINDOW_END=$(( PEAK_END + FLANK ))
+[ "$WINDOW_START" -lt 0 ] && WINDOW_START=0
+
+log "Search window: ${PEAK_CHR_GFF}:${WINDOW_START}-${WINDOW_END} (includes ${FLANK}bp flanks)"
+echo -e "${PEAK_CHR_GFF}\t${WINDOW_START}\t${WINDOW_END}" > "$OUT_DIR/search_window.bed"
+
+########################################
+# STEP 3: EXTRACT GENES FROM GFF
+########################################
+log "Extracting genes from GFF"
+
+zcat "$GFF" | awk -v chr="$PEAK_CHR_GFF" \
+    'BEGIN{OFS="\t"} !/^#/ && $3=="gene" && $1==chr {print $1,$4-1,$5,$6,$7,$9}' \
+    > "$OUT_DIR/genes_chr.bed"
+
+log "Total genes on $PEAK_CHR_GFF: $(wc -l < $OUT_DIR/genes_chr.bed)"
+
+bedtools intersect \
+    -a "$OUT_DIR/genes_chr.bed" \
+    -b "$OUT_DIR/search_window.bed" \
+    > "$OUT_DIR/genes_in_window_raw.bed"
+
+N_GENES=$(wc -l < "$OUT_DIR/genes_in_window_raw.bed")
+log "Genes in window: $N_GENES"
+[ "$N_GENES" -gt 0 ] || die "No genes found in window � check GFF and coordinates"
+
+########################################
+# STEP 4: PARSE GENE NAMES FROM GFF
+########################################
+log "Parsing gene names from GFF attributes"
+
+awk 'BEGIN{OFS="\t"} {
+    attr = $6
+    name = ""; biotype = ""
+    if (match(attr, /Name=([^;]+)/, a))         name = a[1]
+    else if (match(attr, /gene=([^;]+)/, a))     name = a[1]
+    else if (match(attr, /ID=gene-([^;]+)/, a))  name = a[1]
+    else if (match(attr, /ID=([^;]+)/, a))       name = a[1]
+    if (match(attr, /gene_biotype=([^;]+)/, a))  biotype = a[1]
+    print $1, $2, $3, $4, $5, name, biotype
+}' "$OUT_DIR/genes_in_window_raw.bed" > "$OUT_DIR/genes_in_window.bed"
+
+########################################
+# STEP 5: SNP-GENE OVERLAP
+########################################
+log "Intersecting SNPs with genes"
+
+# Translate scaffold name to GFF accession for bedtools, sort by coordinate
+awk -v gff_chr="$PEAK_CHR_GFF" \
+    'BEGIN{OFS="\t"} {print gff_chr, $2, $3, $4, $5}' \
+    "$OUT_DIR/peak_snps.bed" | sort -k1,1 -k2,2n > "$OUT_DIR/peak_snps_gff.bed"
+
+# Sort gene BED by coordinate too
+sort -k1,1 -k2,2n "$OUT_DIR/genes_in_window.bed" > "$OUT_DIR/genes_in_window_sorted.bed"
+
+# SNPs inside gene bodies
+bedtools intersect \
+    -a "$OUT_DIR/peak_snps_gff.bed" \
+    -b "$OUT_DIR/genes_in_window_sorted.bed" \
+    -wa -wb \
+    -sorted \
+    > "$OUT_DIR/snps_in_genes.bed" || true
+
+# Nearest gene for every SNP
+bedtools closest \
+    -a "$OUT_DIR/peak_snps_gff.bed" \
+    -b "$OUT_DIR/genes_in_window_sorted.bed" \
+    -D b \
+    -sorted \
+    > "$OUT_DIR/snps_nearest_gene.bed" || true
+
+log "SNPs inside gene bodies: $(wc -l < $OUT_DIR/snps_in_genes.bed)"
+
+########################################
+# STEP 6: ANNOTATE WITH GO TERMS
+########################################
+log "Merging GO annotations from $GO_CSV"
+
+python3 << PYEOF
+import pandas as pd
+import re
+
+OUT = "peak_annotation"
+PEAK_CHR = "scaffold_5"
+
+# Load GO
+go = pd.read_csv("GO.csv")
+go.columns = [c.strip() for c in go.columns]
+assert "gene" in go.columns, f"'gene' column missing. Found: {list(go.columns)}"
+go["gene"] = go["gene"].astype(str).str.strip()
+go_cols = [c for c in go.columns if c != "gene"]
+print(f"  GO file: {len(go)} genes, GO columns: {go_cols}")
+
+# Load genes in window
+genes = pd.read_csv(f"{OUT}/genes_in_window.bed", sep="\t", header=None,
+                    names=["chr","start","end","score","strand","gene_name","biotype"])
+genes["gene_name"] = genes["gene_name"].astype(str).str.strip()
+print(f"  Genes in window: {len(genes)}")
+
+# Merge GO
+merged = genes.merge(go, left_on="gene_name", right_on="gene", how="left")
+merged["all_GO"] = merged[go_cols].apply(
+    lambda r: " | ".join(
+        f"{c}: {v}" for c, v in zip(go_cols, r)
+        if pd.notna(v) and str(v).strip() not in ("", "-", "nan")
+    ), axis=1
+)
+out_cols = ["chr","start","end","strand","gene_name","biotype"] + go_cols + ["all_GO"]
+out_cols = [c for c in out_cols if c in merged.columns]
+merged[out_cols].to_csv(f"{OUT}/genes_annotated.tsv", sep="\t", index=False)
+print(f"  Genes with GO terms: {merged['all_GO'].str.len().gt(0).sum()}/{len(merged)}")
+
+# Annotate SNP-nearest-gene table
+snps = pd.read_csv(f"{OUT}/snps_nearest_gene.bed", sep="\t", header=None,
+                   names=["snp_chr","snp_start","snp_pos","snp_id","p_wald",
+                          "gene_chr","gene_start","gene_end","gene_score","gene_strand",
+                          "gene_name","gene_biotype","dist_bp"])
+snps["gene_name"] = snps["gene_name"].astype(str).str.strip()
+snps_ann = snps.merge(go, left_on="gene_name", right_on="gene", how="left")
+snps_ann.insert(0, "scaffold", PEAK_CHR)
+snps_ann.to_csv(f"{OUT}/snps_with_nearest_gene_GO.tsv", sep="\t", index=False)
+
+# Top 20
+top_cols = ["scaffold","snp_pos","p_wald","gene_name","gene_biotype","dist_bp"] + go_cols
+top_cols = [c for c in top_cols if c in snps_ann.columns]
+snps_ann.sort_values("p_wald").head(20)[top_cols].to_csv(
+    f"{OUT}/top20_snps_annotated.tsv", sep="\t", index=False)
+print(f"  SNP tables saved ({len(snps_ann)} rows total)")
+PYEOF
+
+########################################
+# STEP 7: SUMMARY REPORT
+########################################
+log "Writing summary"
+
+cat > "$OUT_DIR/peak_summary.txt" << EOF
+====================================================
+ GWAS PEAK ANNOTATION SUMMARY
+====================================================
+Date         : $(date)
+GEMMA name   : ${PEAK_CHR}
+GFF accession: ${PEAK_CHR_GFF} (LG7)
+Peak region  : ${PEAK_START}-${PEAK_END} bp
+Search window: ${WINDOW_START}-${WINDOW_END} bp (flanks: ${FLANK} bp)
+
+TOP SNP:
+$(sed -n '2p' $OUT_DIR/peak_snps_sorted.txt | \
+  awk '{printf "  pos=%-10s  p_wald=%s  beta=%s  af=%s\n", $3, $13, $8, $7}')
+
+Genes in window : $(wc -l < $OUT_DIR/genes_in_window.bed)
+SNPs in genes   : $(wc -l < $OUT_DIR/snps_in_genes.bed)
+
+OUTPUT FILES:
+  peak_snps_sorted.txt           all SNPs in region, sorted by p_wald
+  genes_annotated.tsv            genes in window with GO terms
+  snps_with_nearest_gene_GO.tsv  every SNP with nearest gene + GO
+  top20_snps_annotated.tsv       top 20 SNPs with gene + GO annotation
+====================================================
+EOF
+
+cat "$OUT_DIR/peak_summary.txt"
+log "Done. Results in $OUT_DIR/"
