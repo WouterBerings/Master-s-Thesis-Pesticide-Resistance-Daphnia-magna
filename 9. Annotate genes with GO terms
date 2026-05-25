@@ -1,0 +1,207 @@
+#!/bin/bash -l
+set -euo pipefail
+
+########################################
+# SLURM CONFIG
+########################################
+#SBATCH --job-name=go_descriptions
+#SBATCH --constraint=cascadelake
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=2
+#SBATCH --time=00:30:00
+#SBATCH -A lp_
+#SBATCH -o logs/%x.%j.out
+#SBATCH -e logs/%x.%j.err
+
+########################################
+# LOGGING
+########################################
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+die() { echo "[ERROR] $*" >&2; exit 1; }
+
+########################################
+# INPUTS
+########################################
+GO_CSV="GO.csv"
+GENES_TSV="peak_annotation/genes_annotated.tsv"
+OBO_FILE="go.obo"
+OUT_DIR="peak_annotation"
+OUT_FILE="$OUT_DIR/go_term_descriptions.tsv"
+PY_SCRIPT="tmp/go_descriptions.py"
+
+########################################
+# ENVIRONMENT
+########################################
+source /data/leuven/385/vsc38531/miniconda3/etc/profile.d/conda.sh
+conda activate gemma || die "Conda activation failed"
+
+python3 -c "import pandas" 2>/dev/null || die "pandas not found"
+
+mkdir -p "$OUT_DIR" logs tmp
+
+########################################
+# STEP 1: DOWNLOAD GO OBO IF MISSING
+########################################
+if [ ! -f "$OBO_FILE" ]; then
+    log "Downloading go.obo from OBO Foundry"
+    wget -q --show-progress \
+        "https://purl.obolibrary.org/obo/go.obo" \
+        -O "$OBO_FILE" || die "Download failed - try manually: wget https://purl.obolibrary.org/obo/go.obo"
+    log "go.obo downloaded ($(du -h $OBO_FILE | cut -f1))"
+else
+    log "go.obo already present ($(du -h $OBO_FILE | cut -f1))"
+fi
+
+########################################
+# STEP 2: WRITE PYTHON SCRIPT TO FILE
+########################################
+log "Writing Python script to $PY_SCRIPT"
+
+cat > "$PY_SCRIPT" << 'PYEOF'
+# -*- coding: utf-8 -*-
+import pandas as pd
+import re
+import sys
+
+OBO_FILE  = "go.obo"
+GO_CSV    = "GO.csv"
+GENES_TSV = "peak_annotation/genes_annotated.tsv"
+OUT_FILE  = "peak_annotation/go_term_descriptions.tsv"
+
+# ------------------------------------------------------------------
+# 1. Parse go.obo
+# ------------------------------------------------------------------
+def parse_obo(path):
+    terms = {}
+    current = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line == "[Term]":
+                if current.get("id", "").startswith("GO:"):
+                    terms[current["id"]] = current
+                current = {}
+            elif line.startswith("id: "):
+                current["id"] = line[4:]
+            elif line.startswith("name: "):
+                current["name"] = line[6:]
+            elif line.startswith("namespace: "):
+                current["namespace"] = line[11:].replace("_", " ")
+            elif line.startswith("def: "):
+                m = re.match(r'def: "(.+?)" \[', line)
+                current["def"] = m.group(1) if m else ""
+            elif line.startswith("is_obsolete: true"):
+                current["obsolete"] = True
+    if current.get("id", "").startswith("GO:"):
+        terms[current["id"]] = current
+    return terms
+
+print("  Parsing go.obo ...")
+go_db = parse_obo(OBO_FILE)
+print(f"  Loaded {len(go_db):,} GO terms")
+
+# ------------------------------------------------------------------
+# 2. Load genes_annotated.tsv directly - GO columns already merged in
+# ------------------------------------------------------------------
+merged = pd.read_csv(GENES_TSV, sep="\t")
+merged.columns = [c.strip() for c in merged.columns]
+gene_col = "gene_name"
+assert gene_col in merged.columns, f"Column '{gene_col}' not found in {GENES_TSV}"
+
+go_cols = [c for c in ["eggnog_GO", "interpro_GO", "fantasia_GO"] if c in merged.columns]
+assert go_cols, f"No GO columns found in {GENES_TSV}. Found: {list(merged.columns)}"
+print(f"  Genes to annotate: {len(merged)}, GO columns: {go_cols}")
+
+# ------------------------------------------------------------------
+# 3. Build per-GO-term rows
+# ------------------------------------------------------------------
+def extract_go_ids(cell):
+    if pd.isna(cell) or str(cell).strip() in ("", "-", "nan"):
+        return []
+    return re.findall(r'GO:\d+', str(cell))
+
+rows = []
+for _, row in merged.iterrows():
+    gene    = row.get(gene_col, "")
+    biotype = row.get("biotype", "")
+    for src_col in go_cols:
+        for go_id in extract_go_ids(row.get(src_col)):
+            term = go_db.get(go_id, {})
+            rows.append({
+                "gene":       gene,
+                "biotype":    biotype,
+                "source":     src_col,
+                "go_id":      go_id,
+                "go_name":    term.get("name", "unknown"),
+                "namespace":  term.get("namespace", "unknown"),
+                "definition": term.get("def", ""),
+                "obsolete":   term.get("obsolete", False),
+            })
+
+if not rows:
+    print("  WARNING: No GO IDs found - check GO.csv contains GO:XXXXXXX formatted IDs")
+    sys.exit(0)
+
+result = pd.DataFrame(rows)
+
+n_unknown = (result["go_name"] == "unknown").sum()
+if n_unknown:
+    print(f"  WARNING: {n_unknown} GO IDs not found in go.obo (may be obsolete)")
+
+# ------------------------------------------------------------------
+# 4. Save full table
+# ------------------------------------------------------------------
+result.to_csv(OUT_FILE, sep="\t", index=False)
+print(f"  Full table saved: {OUT_FILE} ({len(result)} rows)")
+
+# ------------------------------------------------------------------
+# 5. Per-gene summary (one row per gene)
+# ------------------------------------------------------------------
+def summarise_gene(grp):
+    parts = []
+    for src, sub in grp.groupby("source"):
+        names = "; ".join(
+            f"{r['go_id']} ({r['go_name']})"
+            for _, r in sub.iterrows()
+            if r["go_name"] != "unknown" and not r["obsolete"]
+        )
+        if names:
+            parts.append(f"[{src}] {names}")
+    return " || ".join(parts)
+
+summary = (
+    result.groupby(["gene", "biotype"])
+          .apply(summarise_gene)
+          .reset_index()
+          .rename(columns={0: "go_summary"})
+)
+summary_file = OUT_FILE.replace(".tsv", "_per_gene.tsv")
+summary.to_csv(summary_file, sep="\t", index=False)
+print(f"  Per-gene summary saved: {summary_file} ({len(summary)} genes)")
+
+# ------------------------------------------------------------------
+# 6. Readable preview in log
+# ------------------------------------------------------------------
+print(f"\n{'='*60}")
+print(f"  GO TERM DESCRIPTIONS - GENES IN PEAK WINDOW")
+print(f"{'='*60}")
+for _, row in summary.iterrows():
+    if row["go_summary"]:
+        print(f"\nGene: {row['gene']}  ({row['biotype']})")
+        for block in row["go_summary"].split(" || "):
+            print(f"  {block}")
+print(f"{'='*60}\n")
+PYEOF
+
+########################################
+# STEP 3: RUN PYTHON SCRIPT
+########################################
+log "Parsing GO terms and looking up descriptions"
+python3 "$PY_SCRIPT"
+
+########################################
+# DONE
+########################################
+log "GO description lookup complete"
+log "Full table : $OUT_FILE"
+log "Per-gene   : ${OUT_FILE%.tsv}_per_gene.tsv"
