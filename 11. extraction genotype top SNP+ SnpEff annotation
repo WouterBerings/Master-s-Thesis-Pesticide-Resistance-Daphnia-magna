@@ -1,0 +1,168 @@
+#ID significant SNPs
+
+awk 'NR==1 || $13 < 5e-8' gemma_results/results.assoc.txt > significant_snps.txt
+# Found 2 SNPs on scaffold_5: positions 1200850 and 1201004
+
+#Extract Genotypes at Significant SNPs
+
+bcftools query \
+  -r "scaffold_5:1200850-1201802" \
+  -f '[%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%GT\n]' \
+  clean_Merged_clean.vcf.gz \
+  > genotypes_at_sig_snps.txt
+
+# Filter to primary SNP
+awk '$3==1200850' genotypes_at_sig_snps.txt > genotypes_1200850.txt
+
+#Classify Individuals by Genotype
+
+# Resistant (A/A)
+awk '$6=="1/1"' genotypes_1200850.txt | awk '{print $1}' | sort > carriers_AA.txt
+
+# Heterozygous (G/A)
+awk '$6=="0/1" || $6=="1/0"' genotypes_1200850.txt | awk '{print $1}' | sort > carriers_GA.txt
+
+# Susceptible (G/G)
+awk '$6=="0/0"' genotypes_1200850.txt | awk '{print $1}' | sort > carriers_GG.txt
+
+#Download Reference Genome and GFF
+
+wget "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/030/254/905/GCA_030254905.1_UOB_LRV0_1/GCA_030254905.1_UOB_LRV0_1_genomic.fna.gz"
+wget "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/030/254/905/GCA_030254905.1_UOB_LRV0_1/GCA_030254905.1_UOB_LRV0_1_genomic.gff.gz"
+gunzip *.gz
+samtools faidx GCA_030254905.1_UOB_LRV0_1_genomic.fna
+
+#Build Chromosome Rename Map
+
+# Match scaffold names to CM names by sequence length
+awk '$1~/^CM/ {print $1, $2}' GCA_030254905.1_UOB_LRV0_1_genomic.fna.fai | \
+  sort -k2,2n > ref_contigs_CM_only.txt
+
+cat > chr_rename_map.txt << 'EOF'
+scaffold_1 CM058172.1
+scaffold_2 CM058171.1
+scaffold_3 CM058173.1
+scaffold_4 CM058175.1
+scaffold_5 CM058177.1
+scaffold_6 CM058174.1
+scaffold_7 CM058179.1
+scaffold_8 CM058180.1
+scaffold_9 CM058178.1
+scaffold_10 CM058176.1
+EOF
+
+#Extract and Rename Gene Variants
+
+# Extract variants in gene OUZ56_014667 (CM058177.1:1200981-1206280)
+# and rename chromosomes to match reference
+bcftools view \
+  -r scaffold_5:1200981-1206280 \
+  clean_Merged_clean.vcf.gz | \
+bcftools annotate \
+  --rename-chrs chr_rename_map.txt | \
+  sed 's/##contig=<ID=scaffold_5,length=11903208>/##contig=<ID=CM058177.1,length=11903108>/' | \
+  bgzip > gene_variants_renamed.vcf.gz
+
+bcftools index gene_variants_renamed.vcf.gz
+
+#Build SnpEff Database
+
+SNPEFF="/apps/leuven/rocky9/skylake/2021a/software/snpEff/5.2c-GCCcore-10.3.0-Java-11"
+module load snpEff
+
+mkdir -p /lustre1/scratch/385/vsc38531/snpeff_data/Dmagna_LRV0
+cp GCA_030254905.1_UOB_LRV0_1_genomic.fna \
+   /lustre1/scratch/385/vsc38531/snpeff_data/Dmagna_LRV0/sequences.fa
+cp GCA_030254905.1_UOB_LRV0_1_genomic.gff \
+   /lustre1/scratch/385/vsc38531/snpeff_data/Dmagna_LRV0/genes.gff
+
+cp $SNPEFF/snpEff.config ./snpEff.config
+echo "Dmagna_LRV0.genome : Daphnia_magna_LRV0_1" >> ./snpEff.config
+
+java -jar $SNPEFF/snpEff.jar build \
+  -gff3 -v -nodownload \
+  -noCheckCds -noCheckProtein \
+  -config ./snpEff.config \
+  -dataDir /lustre1/scratch/385/vsc38531/snpeff_data \
+  Dmagna_LRV0 \
+  2> snpeff_build.err
+
+# Annotate Variants
+
+java -jar $SNPEFF/snpEff.jar ann \
+  -v -noStats -nodownload \
+  -config ./snpEff.config \
+  -dataDir /lustre1/scratch/385/vsc38531/snpeff_data \
+  Dmagna_LRV0 \
+  gene_variants_renamed.vcf.gz \
+  > gene_variants_annotated.vcf
+
+bgzip -f gene_variants_annotated.vcf
+tabix -p vcf gene_variants_annotated.vcf.gz
+
+#Calculate Allele Frequencies per Group
+
+# Resistant individuals
+bcftools view -S carriers_AA.txt gene_variants_renamed.vcf.gz | \
+  bcftools +fill-tags -- -t AF | \
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+  > missense_af_resistant.txt
+
+# Susceptible individuals
+bcftools view -S carriers_GG.txt gene_variants_renamed.vcf.gz | \
+  bcftools +fill-tags -- -t AF | \
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+  > missense_af_susceptible.txt
+
+# Heterozygous individuals
+bcftools view -S carriers_GA.txt gene_variants_renamed.vcf.gz | \
+  bcftools +fill-tags -- -t AF | \
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+  > missense_af_heterozygous.txt
+
+  ##EXTRACT info for plot building
+
+#Exon structrure
+grep "OUZ56_014667" GCA_030254905.1_UOB_LRV0_1_genomic.gff | \
+  grep -P "\texon\t" | \
+  awk '{print $1,$4,$5,$7}' | \
+  sort -k2,2n
+
+
+#CDS coordinates
+grep "OUZ56_014667" GCA_030254905.1_UOB_LRV0_1_genomic.gff | \
+  grep -P "\tCDS\t" | \
+  awk '{print $1,$4,$5,$7,$9}' | \
+  sort -k2,2n
+
+#SNPEff annotations
+bcftools view gene_variants_annotated.vcf.gz | \
+  grep -v "^#" | \
+  awk '{print $2, $4, $5, $8}' | \
+  grep "missense_variant"
+
+# Check the full protein length
+grep "OUZ56_014667" GCA_030254905.1_UOB_LRV0_1_genomic.gff | \
+  grep -P "\tgene\t" | \
+  awk '{print $4,$5,$5-$4}'
+
+#check how often missense variants occur (significantly different?)
+
+# All three groups
+for group in resistant susceptible heterozygous; do
+    case $group in
+        resistant)  samples="carriers_AA.txt" ;;
+        susceptible) samples="carriers_GG.txt" ;;
+        heterozygous) samples="carriers_GA.txt" ;;
+    esac
+    
+    bcftools view -S $samples gene_variants_renamed.vcf.gz | \
+        bcftools +fill-tags -- -t AF,AC,AN | \
+        bcftools query \
+            -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%INFO/AC\t%INFO/AN\n' \
+        > af_all_missense_${group}.txt
+done
+
+#cdd annotations: https://www.ncbi.nlm.nih.gov/protein/KAK4025608.1
+#Compare and Plot in R
+
