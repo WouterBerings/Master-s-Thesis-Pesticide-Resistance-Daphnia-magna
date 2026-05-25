@@ -1,0 +1,582 @@
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(data.table)
+  library(scales)
+  library(grid)
+  library(gtable)
+})
+
+has_ggrepel <- requireNamespace("ggrepel", quietly = TRUE)
+
+ATAC_OPEN  <- "#7DBF8E"   # matte light green
+ATAC_CLOSE <- "#D3D3D3"   # light grey (matches exon fill)
+
+PAL <- list(
+  chr_a    = "blue4",
+  chr_b    = "orange3",
+  sig_pt   = "#c0392b",
+  top_hit  = "#c0392b",
+  sig_line = "#c0392b",
+  sug_line = "#1a6bb5",
+  gene     = "#2c2c2c",
+  exon     = "lightgrey",
+  bg       = "white"
+)
+
+GWAS_CHROM       <- "scaffold_5"
+GFF_CHROM        <- "CM058177.1"
+chrom_label     <- function(x) sub("scaffold_", "", x, ignore.case=TRUE)
+normalise_chrom <- function(x) ifelse(x == GFF_CHROM, GWAS_CHROM, x)
+
+# =============================================================================
+# LOADERS
+# =============================================================================
+
+load_gwas <- function(path) {
+  dt  <- fread(path)
+  cn  <- colnames(dt)
+  chr_col <- cn[grep("^(chr|chrom|scaffold|contig)", cn, ignore.case=TRUE)][1]
+  bp_col  <- cn[grep("^(ps|bp|pos|position)",        cn, ignore.case=TRUE)][1]
+  p_col   <- cn[grep("^(p_wald|p_lrt|p$|pval)",     cn, ignore.case=TRUE)][1]
+  message(sprintf("  GWAS columns: CHR='%s'  BP='%s'  P='%s'",
+                  chr_col, bp_col, p_col))
+  out <- dt[, .(CHR=as.character(get(chr_col)),
+                BP =as.integer(get(bp_col)),
+                P  =as.numeric(get(p_col)))]
+  out[, NEGLOGP := -log10(pmax(P, 1e-300))]
+  out <- out[!is.na(P) & P > 0 & P <= 1]
+  rm(dt); gc()
+  out
+}
+
+load_gff <- function(path) {
+  lines  <- readLines(path)
+  lines  <- lines[!grepl("^#", lines) & nzchar(trimws(lines))]
+  fields <- strsplit(lines, "\t")
+  fields <- fields[lengths(fields) >= 8]
+  df <- as.data.frame(do.call(rbind, lapply(fields, function(x) x[1:9])),
+                      stringsAsFactors=FALSE)
+  names(df) <- c("seqname","source","feature","start","end",
+                 "score","strand","frame","attributes")
+  df$start   <- as.integer(df$start)
+  df$end     <- as.integer(df$end)
+  df$seqname <- normalise_chrom(df$seqname)
+  df$name <- mapply(function(attr, feat) {
+    m <- regmatches(attr, regexpr("(?i)Name=([^;]+)", attr, perl=TRUE))
+    if (length(m) && nzchar(m)) return(sub("(?i)Name=","",m,perl=TRUE))
+    m2 <- regmatches(attr, regexpr('gene_id "([^"]+)"', attr, perl=TRUE))
+    if (length(m2) && nzchar(m2))
+      return(sub('gene_id "([^"]+)".*',"\\1",m2,perl=TRUE))
+    m3 <- regmatches(attr, regexpr("(?i)ID=([^;]+)", attr, perl=TRUE))
+    if (length(m3) && nzchar(m3)) return(sub("(?i)ID=","",m3,perl=TRUE))
+    feat
+  }, df$attributes, df$feature, SIMPLIFY=TRUE)
+  df
+}
+
+load_bed <- function(path) {
+  dt <- fread(path, header=FALSE, sep="\t", fill=TRUE)
+  setnames(dt, 1:3, c("chrom","start","end"))
+  dt[, chrom := normalise_chrom(as.character(chrom))]
+  dt[, score := if (ncol(dt) >= 4) as.numeric(dt[[4]]) else 1]
+  dt[is.na(score), score := 0]
+  dt
+}
+
+# =============================================================================
+# SHARED X SCALE
+# =============================================================================
+zoom_x_scale <- function(start, end) {
+  scale_x_continuous(
+    limits = c(start, end),
+    labels = function(x) formatC(x, format="d", big.mark=","),
+    expand = expansion(mult=c(0.01, 0.01))
+  )
+}
+
+# =============================================================================
+# HELPER: fraction of gtable total width at left/right edge of panel cell
+# Returns named vector: left = fraction at left edge of panel,
+#                       right = fraction at right edge of panel
+# =============================================================================
+gt_panel_fracs <- function(gt) {
+  pcol  <- gt$layout$l[gt$layout$name == "panel"][1]
+  ws    <- as.numeric(gt$widths)
+  total <- sum(ws)
+  c(left  = sum(ws[seq_len(pcol - 1)]) / total,
+    right = sum(ws[seq_len(pcol)])      / total)
+}
+
+# =============================================================================
+# PANEL BUILDERS
+# =============================================================================
+
+# -- A: Manhattan --------------------------------------------------------------
+build_manhattan_full <- function(gwas, zoom_chrom,
+                                 sig=5e-8, suggestive=1e-5) {
+  setDT(gwas)
+  chr_order <- c(as.character(1:22), "X", "Y",
+                 unique(gwas$CHR[!gwas$CHR %in% as.character(c(1:22,"X","Y"))]))
+  present <- chr_order[chr_order %in% gwas$CHR]
+
+  chr_max <- gwas[, .(mx=max(BP)), by=CHR][match(present, CHR)]
+  chr_max[, offset := c(0, cumsum(head(mx,-1)))]
+  chr_mid <- chr_max[, .(CHR, mid=offset+mx/2, label=chrom_label(CHR))]
+
+  col_lookup <- setNames(ifelse(seq_along(present)%%2==1,"a","b"), present)
+  gwas[chr_max, on="CHR", offset := i.offset]
+  gwas[, `:=`(xpos=BP+offset, col=col_lookup[CHR], nlp=pmin(NEGLOGP,15))]
+  gwas[, offset := NULL]
+
+  plot_df <- gwas[, .(xpos, col, nlp, P)]
+  xlim    <- range(plot_df$xpos, na.rm=TRUE)
+
+  zoff <- chr_max$offset[chr_max$CHR == zoom_chrom]
+  if (!length(zoff)) { warning("zoom_chrom not found"); zoff <- 0 }
+
+  rm(gwas); gc()
+  ymax <- max(plot_df$nlp, na.rm=TRUE) * 1.08
+
+  p <- ggplot(plot_df, aes(x=xpos, y=nlp, colour=col)) +
+    geom_point(size=0.9, alpha=0.7, shape=16) +
+    geom_hline(yintercept=-log10(suggestive),
+               linetype="dashed", colour=PAL$sug_line, linewidth=0.7) +
+    geom_hline(yintercept=-log10(sig),
+               linetype="solid",  colour=PAL$sig_line, linewidth=0.8) +
+    scale_colour_manual(values=c(a=PAL$chr_a, b=PAL$chr_b), guide="none") +
+    scale_x_continuous(breaks=chr_mid$mid, labels=chr_mid$label,
+                       expand=expansion(mult=c(0.01,0.01))) +
+    scale_y_continuous(expand=expansion(mult=c(0,0.05)), limits=c(0,ymax)) +
+    labs(x="Chromosome",
+         y=expression(-log[10](italic(p))),
+         title="A   Manhattan Plot") +
+    theme_classic(base_size=18) +
+    theme(
+      plot.background  = element_rect(fill=PAL$bg, colour=NA),
+      panel.background = element_rect(fill=PAL$bg, colour=NA),
+      plot.title  = element_text(face="bold", size=20, hjust=0),
+      axis.title.x= element_text(size=18),
+      axis.title.y= element_text(size=18),
+      axis.text.x = element_text(size=15),
+      axis.text.y = element_text(size=15),
+      panel.grid  = element_blank(),
+      plot.margin = margin(t=4, r=6, b=2, l=4)
+    )
+
+  list(plot=p, man_xlim=xlim)
+}
+
+# -- B: Zoom GWAS --------------------------------------------------------------
+build_zoom <- function(gwas_path, chrom, start, end,
+                       sig=5e-8, suggestive=1e-5) {
+  dt  <- fread(gwas_path)
+  cn  <- colnames(dt)
+  chr_col <- cn[grep("^(chr|chrom|scaffold|contig)", cn, ignore.case=TRUE)][1]
+  bp_col  <- cn[grep("^(ps|bp|pos|position)",        cn, ignore.case=TRUE)][1]
+  p_col   <- cn[grep("^(p_wald|p_lrt|p$|pval)",     cn, ignore.case=TRUE)][1]
+
+  sub <- dt[as.character(get(chr_col))==chrom &
+              as.integer(get(bp_col))>=start  &
+              as.integer(get(bp_col))<=end,
+            .(BP=as.integer(get(bp_col)), P=as.numeric(get(p_col)))]
+  rm(dt); gc()
+
+  sub[, `:=`(nlp=pmin(-log10(pmax(P,1e-300)),15), sig=P<sig)]
+  if (nrow(sub)==0) warning("No GWAS SNPs in zoom region.")
+  top <- if (nrow(sub)>0) sub[which.max(nlp)] else NULL
+
+  # Collect significant SNP positions for vertical lines
+  sig_snps <- sub[sig==TRUE, unique(BP)]
+
+  p <- ggplot(sub, aes(x=BP, y=nlp, colour=sig)) +
+    geom_point(size=2.5, alpha=0.85, shape=16) +
+    geom_hline(yintercept=-log10(suggestive),
+               linetype="dashed", colour=PAL$sug_line, linewidth=0.7) +
+    geom_hline(yintercept=-log10(sig),
+               linetype="solid",  colour=PAL$sig_line, linewidth=0.8)
+
+  # Add thin dashed vertical lines at significant SNP positions
+  if (length(sig_snps) > 0) {
+    p <- p + geom_vline(xintercept=sig_snps,
+                        linetype="dashed", colour=PAL$sig_pt,
+                        linewidth=0.4, alpha=0.6)
+  }
+
+  if (!is.null(top) && nrow(top)>0) {
+    lbl <- sprintf("p = %.2e", top$P)
+    if (has_ggrepel) {
+      p <- p + ggrepel::geom_text_repel(
+        data=as.data.frame(top), mapping=aes(x=BP, y=nlp, label=lbl),
+        size=4.5, colour=PAL$top_hit, fontface="bold",
+        nudge_y=0.6, segment.colour=PAL$top_hit,
+        segment.size=0.5, inherit.aes=FALSE)
+    } else {
+      p <- p + geom_text(data=as.data.frame(top), aes(label=lbl),
+                         size=6, colour=PAL$top_hit, vjust=-1)
+    }
+  }
+
+  p +
+    scale_colour_manual(values=c(`FALSE`=PAL$chr_a, `TRUE`=PAL$sig_pt),
+                        guide="none") +
+    zoom_x_scale(start, end) +
+    scale_y_continuous(expand=expansion(mult=c(0,0.12))) +
+    labs(x=NULL,
+         y= expression(-log[10](italic(p))),
+         title=sprintf("B   Chromosome %s: %s\u2013%s",
+                       chrom_label(chrom),
+                       formatC(start,format="d",big.mark=","),
+                       formatC(end,  format="d",big.mark=","))) +
+    theme_classic(base_size=18) +
+    theme(
+      plot.background  = element_rect(fill=PAL$bg, colour=NA),
+      panel.background = element_rect(fill=PAL$bg, colour=NA),
+      plot.title  = element_text(face="bold", size=20, hjust=0),
+      axis.text.x = element_text(size=15),
+      axis.ticks.x= element_line(),
+      axis.line.x = element_line(),
+      axis.text.y = element_text(size=15),
+      axis.title.y= element_text(size = 18),
+      panel.grid.major.y = element_line(colour="grey90", linewidth=0.3),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      plot.margin = margin(t=4, r=6, b=2, l=4)
+    )
+}
+
+# -- C: ATAC-seq ---------------------------------------------------------------
+# sig_bp: optional vector of significant SNP positions for vertical lines
+build_atac <- function(atac, chrom, start_bp, end_bp, sig_bp=NULL) {
+  sub <- as.data.frame(atac)[atac$chrom==chrom &
+                               atac$start<=end_bp &
+                               atac$end>=start_bp, ]
+  sub$xs <- pmax(sub$start, start_bp)
+  sub$xe <- pmin(sub$end,   end_bp)
+  if (nrow(sub)==0) warning("No ATAC peaks for chrom='",chrom,"'.")
+
+  p <- ggplot() +
+    annotate("rect", xmin=start_bp, xmax=end_bp, ymin=0, ymax=1,
+             fill=ATAC_CLOSE, colour=NA) +
+    geom_rect(data=sub,
+              aes(xmin=xs, xmax=xe, ymin=0, ymax=1,
+                  fill="Accessible chromatin"),
+              colour=NA)
+
+  # Add thin dashed vertical lines at significant SNP positions
+  if (!is.null(sig_bp) && length(sig_bp) > 0) {
+    p <- p + geom_vline(xintercept=sig_bp,
+                        linetype="dashed", colour=PAL$sig_pt,
+                        linewidth=0.4, alpha=0.6)
+  }
+
+  p +
+    scale_fill_manual(
+      name=NULL,
+      values=c("Accessible chromatin"=ATAC_OPEN),
+      guide="none"   # legend drawn manually as a grob, flush with panel left
+    ) +
+    zoom_x_scale(start_bp, end_bp) +
+    scale_y_continuous(limits=c(0,1), expand=expansion(mult=c(0.3,0.3))) +
+    labs(title="C   ATAC-seq") +
+    theme_classic(base_size=18) +
+    theme(
+      plot.background  = element_rect(fill=PAL$bg, colour=NA),
+      panel.background = element_rect(fill=PAL$bg, colour=NA),
+      plot.title  = element_text(face="bold", size=20, hjust=0),
+      axis.text.x = element_blank(),
+      axis.ticks.x= element_blank(),
+      axis.line.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y= element_blank(),
+      axis.line.y = element_blank(),
+      axis.title  = element_blank(),
+      panel.grid  = element_blank(),
+      plot.margin = margin(t=10, r=6, b=10, l=4)
+    )
+}
+
+# -- D: Genes ------------------------------------------------------------------
+# sig_bp: optional vector of significant SNP positions for vertical lines
+build_genes <- function(gff, chrom, start, end, sig_bp=NULL) {
+
+  genes <- gff[gff$feature=="gene" & gff$seqname==chrom &
+               gff$start<=end     & gff$end>=start, ]
+  genes <- genes[order(genes$start), ]
+
+  exons_all <- gff[gff$feature=="exon" & gff$seqname==chrom &
+                   gff$start<=end     & gff$end>=start, ]
+
+  if (nrow(genes)==0) {
+    warning("No genes for chrom='",chrom,"'. GFF seqnames: ",
+            paste(unique(gff$seqname), collapse=", "))
+    return(ggplot() + labs(title="D   Genes") +
+             zoom_x_scale(start, end) +
+             theme_classic(base_size=18) +
+             theme(plot.title=element_text(face="bold",size=20,hjust=0)))
+  }
+
+  # Greedy track packing
+  genes$track <- 0L; track_ends <- numeric(0)
+  for (i in seq_len(nrow(genes))) {
+    placed <- FALSE
+    for (ti in seq_along(track_ends)) {
+      if (genes$start[i] > track_ends[ti] + 500) {
+        genes$track[i] <- ti; track_ends[ti] <- genes$end[i]
+        placed <- TRUE; break
+      }
+    }
+    if (!placed) {
+      track_ends <- c(track_ends, genes$end[i])
+      genes$track[i] <- length(track_ends) - 1L
+    }
+  }
+  n_tr <- max(genes$track, 0L) + 1L
+  genes$xs <- pmax(genes$start, start)
+  genes$xe <- pmin(genes$end,   end)
+  genes$gene_len <- genes$end - genes$start
+
+  exons2 <- NULL
+  if (nrow(exons_all) > 0) {
+    exon_rows <- lapply(seq_len(nrow(exons_all)), function(i) {
+      es <- exons_all$start[i]; ee <- exons_all$end[i]
+      cand <- which(genes$start <= es & genes$end >= ee)
+      if (length(cand)==0)
+        cand <- which((es >= genes$start & es <= genes$end) |
+                      (ee >= genes$start & ee <= genes$end))
+      if (length(cand)==0) return(NULL)
+      best <- cand[which.min(genes$gene_len[cand])]
+      data.frame(
+        track = genes$track[best],
+        xs    = pmax(es, start),
+        xe    = pmin(ee, end),
+        stringsAsFactors = FALSE
+      )
+    })
+    exons2 <- do.call(rbind, exon_rows[!sapply(exon_rows, is.null)])
+    if (!is.null(exons2) && nrow(exons2)>0)
+      exons2 <- exons2[exons2$xe > exons2$xs, ]
+  }
+
+  y_lo <- -0.9
+  y_hi <- (n_tr - 1) + 1.4
+
+  p <- ggplot() +
+    # intron lines
+    geom_segment(data=genes,
+                 aes(x=xs, xend=xe, y=track, yend=track),
+                 colour=PAL$gene, linewidth=1.2)
+
+  if (!is.null(exons2) && nrow(exons2)>0) {
+    p <- p + geom_rect(data=exons2,
+                       aes(xmin=xs, xmax=xe,
+                           ymin=track-0.38, ymax=track+0.38),
+                       fill=PAL$exon, colour="grey50", linewidth=0.35)
+  }
+
+  # Add thin dashed vertical lines at significant SNP positions
+  if (!is.null(sig_bp) && length(sig_bp) > 0) {
+    p <- p + geom_vline(xintercept=sig_bp,
+                        linetype="dashed", colour=PAL$sig_pt,
+                        linewidth=0.4, alpha=0.6)
+  }
+
+  p <- p +
+    # strand arrows
+    geom_segment(data=genes,
+                 aes(x=(xs+xe)/2,
+                     xend=(xs+xe)/2 + ifelse(strand=="+",
+                             pmax((xe-xs)*0.06,(end-start)*0.015),
+                            -pmax((xe-xs)*0.06,(end-start)*0.015)),
+                     y=track, yend=track),
+                 colour=PAL$gene, linewidth=0.8,
+                 arrow=arrow(length=unit(6,"pt"), type="closed")) +
+    # gene name labels
+    geom_text(data=genes,
+              aes(x=(xs+xe)/2, y=track+0.60, label=name),
+              size=5.0, colour=PAL$gene, fontface="italic",
+              hjust=0.5, vjust=0) +
+    zoom_x_scale(start, end) +
+    scale_y_continuous(limits=c(y_lo, y_hi)) +
+    labs(title="D   Genes") +
+    theme_classic(base_size=18) +
+    theme(
+      plot.background  = element_rect(fill=PAL$bg, colour=NA),
+      panel.background = element_rect(fill=PAL$bg, colour=NA),
+      plot.title  = element_text(face="bold", size=20, hjust=0),
+      axis.text.x = element_blank(),
+      axis.ticks.x= element_blank(),
+      axis.line.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y= element_blank(),
+      axis.line.y = element_blank(),
+      axis.title  = element_blank(),
+      panel.grid  = element_blank(),
+      plot.margin = margin(t=4, r=6, b=4, l=4)
+    )
+
+  p
+}
+
+# =============================================================================
+# COMPOSE
+# =============================================================================
+compose_figure <- function(man_info, p_zoom, p_atac, p_gene,
+                           out_path = "genome_browser.pdf",
+                           width = 14, height = 12) {
+
+  gt_man  <- ggplotGrob(man_info$plot)
+  gt_zoom <- ggplotGrob(p_zoom)
+  gt_atac <- ggplotGrob(p_atac)
+  gt_gene <- ggplotGrob(p_gene)
+
+  # -- Align B / C / D panel cells to identical left & right widths ----------
+  align_widths <- function(gts) {
+    pcols <- sapply(gts, function(g) which(g$layout$name == "panel")[1])
+    max_left  <- Reduce(unit.pmax, lapply(seq_along(gts), function(i)
+                   gts[[i]]$widths[seq_len(pcols[i] - 1)]))
+    max_right <- Reduce(unit.pmax, lapply(seq_along(gts), function(i) {
+                   g <- gts[[i]]; p <- pcols[i]
+                   g$widths[(p + 1):length(g$widths)] }))
+    lapply(seq_along(gts), function(i) {
+      g <- gts[[i]]; p <- pcols[i]
+      g$widths[seq_len(p - 1)]           <- max_left
+      g$widths[(p + 1):length(g$widths)] <- max_right
+      g
+    })
+  }
+
+  aligned <- align_widths(list(gt_zoom, gt_atac, gt_gene))
+  gt_zoom <- aligned[[1]]; gt_atac <- aligned[[2]]; gt_gene <- aligned[[3]]
+
+  # -- Layout geometry --------------------------------------------------------
+  # Added spacer between Manhattan and zoom panel
+  # Order is now:
+  # A Manhattan
+  # spacer
+  # B Zoom
+  # D Genes
+  # C ATAC
+  
+  h_in <- c(
+    man    = 3.0,
+    spacer = 0.45,   # <-- adjustable blank space
+    zoom   = 2.5,
+    gene   = 2.4,
+    atac   = 0.9
+  )
+  
+  total <- sum(h_in)
+  
+  lm <- 0.01
+  rm_pg <- 0.01
+  tm <- 0.01
+  bm <- 0.02
+  
+  iw <- 1 - lm - rm_pg
+  ih <- 1 - tm - bm
+  
+  fracs <- setNames(as.numeric(h_in / total * ih), names(h_in))
+  
+  cum <- cumsum(c(0, rev(fracs)))
+  
+  y_tops <- setNames(rev(bm + cum[-1]), names(h_in))
+  y_bots <- setNames(y_tops - fracs, names(h_in))
+  
+  # -- Open device -----------------------------------------------------------
+  if (grepl("\\.pdf$", out_path, ignore.case = TRUE)) {
+    pdf(out_path, width = width, height = height)
+  } else {
+    png(out_path, width = width * 150, height = height * 150,
+        res = 150, bg = PAL$bg)
+  }
+  grid.newpage()
+  grid.rect(gp = gpar(fill = PAL$bg, col = NA))
+
+  # -- Draw panels top ? bottom: A, B, C, D ---------------------------------
+  draw_gt <- function(gt, slot) {
+    vp <- viewport(x = lm, y = y_bots[[slot]],
+                   width = iw, height = fracs[[slot]],
+                   just = c("left", "bottom"))
+    pushViewport(vp); grid.draw(gt); popViewport()
+  }
+
+  draw_gt(gt_man,  "man")
+  draw_gt(gt_zoom, "zoom")
+  draw_gt(gt_gene, "gene")
+  draw_gt(gt_atac, "atac")
+
+
+
+  # -- ATAC legend below-left ---------------------------------------------
+{
+  pcol_a      <- gt_atac$layout$l[gt_atac$layout$name == "panel"][1]
+  ws_a        <- as.numeric(gt_atac$widths)
+
+  left_frac_a <- sum(ws_a[seq_len(pcol_a - 1)]) / sum(ws_a)
+  panel_left  <- lm + iw * left_frac_a
+
+  key_h  <- 0.25
+  key_w  <- 0.8
+  gap_cm <- 0.12
+
+  # place below the ATAC panel
+  leg_y <- unit(y_bots[["atac"]] - 0.015, "npc")
+
+  grid.rect(
+    x      = unit(panel_left, "npc"),
+    y      = leg_y,
+    width  = unit(key_w, "cm"),
+    height = unit(key_h, "cm"),
+    just   = c("left", "bottom"),
+    gp     = gpar(fill = ATAC_OPEN, col = "grey50", lwd = 0.6)
+  )
+
+  grid.text(
+    label = "Accessible chromatin",
+    x     = unit(panel_left, "npc") + unit(key_w + gap_cm, "cm"),
+    y     = leg_y + unit(key_h / 2, "cm"),
+    just  = c("left", "center"),
+    gp    = gpar(fontsize = 15)
+  )
+}
+  dev.off()
+  message("Saved \u2192 ", out_path)
+}
+
+# =============================================================================
+# RUN
+# =============================================================================
+GWAS_PATH  <- "results.assoc.txt"
+zoom_start <- 1190000   # window for B/C/D
+zoom_end   <- 1215000   # ? updated from 1210000
+chrom      <- GWAS_CHROM
+
+message("Loading data ...")
+gwas <- load_gwas(GWAS_PATH)
+gff  <- load_gff("annotation.gff")
+atac <- load_bed("atacseq.bed")
+
+# Pre-compute significant SNP positions in the zoom window (shared by B/C/D)
+sig_threshold <- 5e-8
+sig_positions <- gwas[CHR == chrom &
+                      BP  >= zoom_start &
+                      BP  <= zoom_end   &
+                      P   <  sig_threshold, unique(BP)]
+message(sprintf("  Found %d significant SNP(s) in zoom window.", length(sig_positions)))
+
+message("Building Manhattan ...")
+man <- build_manhattan_full(gwas, chrom)
+rm(gwas); gc()
+
+message("Building zoom panel ...")
+p_zoom <- build_zoom(GWAS_PATH, chrom, zoom_start, zoom_end)
+
+message("Building ATAC panel ...")
+p_atac <- build_atac(atac, chrom, zoom_start, zoom_end, sig_bp=sig_positions)
+
+message("Building gene panel ...")
+p_gene <- build_genes(gff, chrom, zoom_start, zoom_end, sig_bp=sig_positions)
+
+message("Composing figure ...")
+compose_figure(man, p_zoom, p_atac, p_gene, out_path="genome_browser.png")
