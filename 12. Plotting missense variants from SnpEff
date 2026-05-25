@@ -1,0 +1,501 @@
+# ============================================================
+# CYP3A Resistance Figure — full pipeline
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tidyr)
+library(ggpubr)      # stat_pvalue_manual
+library(patchwork)   # (p3 / p2 / p1)
+
+# ------------------------------------------------------------
+# 1. Read allele-frequency tables
+# ------------------------------------------------------------
+read_af <- function(file, group) {
+  df <- read.table(file, header = FALSE,
+                   col.names = c("CHROM","POS","REF","ALT","AF","AC","AN"))
+  df$group <- group
+  df
+}
+
+res <- read_af("af_all_missense_resistant.txt",    "resistant")
+het <- read_af("af_all_missense_heterozygous.txt", "heterozygous")
+sus <- read_af("af_all_missense_susceptible.txt",  "susceptible")
+
+# ------------------------------------------------------------
+# 2. Missense positions from SnpEff
+# ------------------------------------------------------------
+missense_pos <- c(1201536, 1201596, 1201898, 1202105, 1202336,
+                  1202664, 1202666, 1203130, 1203832, 1203864,
+                  1204117, 1204330, 1204434, 1204442, 1204447,
+                  1204471, 1204489, 1204500, 1204530, 1204631,
+                  1204676, 1204895, 1205077, 1205255, 1205416,
+                  1205628, 1205790, 1205889, 1206216, 1206239)
+
+res <- res[res$POS %in% missense_pos, ]
+het <- het[het$POS %in% missense_pos, ]
+sus <- sus[sus$POS %in% missense_pos, ]
+
+# ------------------------------------------------------------
+# 3. Merge resistant vs susceptible for Fisher's test,
+#    and also bring in heterozygous AF for plotting
+# ------------------------------------------------------------
+merged <- merge(
+  res[, c("POS","REF","ALT","AF","AC","AN")],
+  sus[, c("POS","AF","AC","AN")],
+  by = "POS", suffixes = c("_res","_sus")
+)
+
+# Add heterozygous AF (for Plot 2)
+merged <- merge(
+  merged,
+  het[, c("POS","AF")],
+  by = "POS", all.x = TRUE
+)
+names(merged)[names(merged) == "AF"] <- "AF_het"
+
+# ------------------------------------------------------------
+# 4. Fisher's exact test: resistant vs susceptible
+# ------------------------------------------------------------
+fisher_results <- lapply(1:nrow(merged), function(i) {
+  row <- merged[i, ]
+  mat <- matrix(c(
+    round(row$AC_res),
+    round(row$AN_res - row$AC_res),
+    round(row$AC_sus),
+    round(row$AN_sus - row$AC_sus)
+  ), nrow = 2)
+  ft <- fisher.test(mat)
+  data.frame(
+    POS        = row$POS,
+    REF        = row$REF,
+    ALT        = row$ALT,
+    AF_res     = row$AF_res,
+    AF_sus     = row$AF_sus,
+    AF_het     = row$AF_het,
+    diff       = row$AF_res - row$AF_sus,
+    p_fisher   = ft$p.value,
+    odds_ratio = ft$estimate
+  )
+})
+
+fisher_df <- do.call(rbind, fisher_results)
+
+# Bonferroni correction (30 tests)
+fisher_df$p_bonferroni <- fisher_df$p_fisher * 30
+fisher_df$significant  <- fisher_df$p_bonferroni < 0.05
+
+# ------------------------------------------------------------
+# 5. AA-change labels
+# ------------------------------------------------------------
+aa_changes <- c(
+  "1201536" = "Ser122Thr", "1201596" = "Thr142Ser",
+  "1201898" = "Asp197Gly", "1202105" = "Arg239Ile",
+  "1202336" = "Asp290Gly", "1202664" = "Asp354Glu",
+  "1202666" = "Asp355Val", "1203130" = "Met467Ile",
+  "1203832" = "Ser504Leu", "1203864" = "Thr515Ser",
+  "1204117" = "Pro576Thr", "1204330" = "Phe626Tyr",
+  "1204434" = "Met639Val", "1204442" = "Ile641Met",
+  "1204447" = "Leu643Pro", "1204471" = "Thr651Ile",
+  "1204489" = "Glu657Gly", "1204500" = "Val661Ile",
+  "1204530" = "Thr671Pro", "1204631" = "Ser679Gly",
+  "1204676" = "Ser694Ala", "1204895" = "Ala739Pro",
+  "1205077" = "Met779Ile", "1205255" = "Thr815Ser",
+  "1205416" = "Met843Leu", "1205628" = "Met893Leu",
+  "1205790" = "Glu924Asp", "1205889" = "Asp957Glu",
+  "1206216" = "Thr1024Ile","1206239" = "Ala1032Thr"
+)
+
+fisher_df$aa <- aa_changes[as.character(fisher_df$POS)]
+
+# ------------------------------------------------------------
+# 6. Significance stars (used in Plot 2)
+# ------------------------------------------------------------
+fisher_df$stars <- ifelse(
+  fisher_df$p_bonferroni < 0.001, "***",
+  ifelse(fisher_df$p_bonferroni < 0.01, "**",
+         ifelse(fisher_df$p_bonferroni < 0.05, "*", "")))
+
+# Print sorted results
+fisher_df_sorted <- fisher_df[order(fisher_df$p_fisher), ]
+print(fisher_df_sorted[, c("aa","AF_res","AF_sus","diff",
+                           "p_fisher","p_bonferroni","significant","stars")],
+      digits = 3, row.names = FALSE)
+
+# ------------------------------------------------------------
+# 7. missense_sig — significant variants only (used in Plot 2)
+# ------------------------------------------------------------
+missense_sig <- fisher_df[fisher_df$significant == TRUE, ]
+
+# Direction: resistant-enriched if diff > 0, susceptible if diff < 0
+missense_sig$direction <- ifelse(missense_sig$diff > 0, "Resistant", "Susceptible")
+
+# ------------------------------------------------------------
+# 8. Exon structure
+# ------------------------------------------------------------
+exons <- data.frame(
+  exon_num      = 1:26,
+  genomic_start = c(1200981,1201123,1201279,1201497,1201684,1201839,
+                    1202072,1202275,1202471,1202662,1202812,1203022,
+                    1203255,1203810,1204056,1204215,1204431,1204625,
+                    1204798,1205010,1205206,1205404,1205598,1205754,
+                    1205963,1206188),
+  genomic_end   = c(1201057,1201219,1201428,1201613,1201772,1201990,
+                    1202196,1202394,1202602,1202750,1202955,1203184,
+                    1203287,1203985,1204152,1204364,1204547,1204713,
+                    1204949,1205134,1205325,1205535,1205686,1205897,
+                    1206125,1206280)
+)
+
+exons$nt_length   <- exons$genomic_end - exons$genomic_start + 1
+exons$nt_cumend   <- cumsum(exons$nt_length)
+exons$nt_cumstart <- c(0, head(exons$nt_cumend, -1))
+exons$aa_start    <- floor(exons$nt_cumstart / 3) + 1
+exons$aa_end      <- ceiling(exons$nt_cumend / 3)
+
+# Colours: grey = outside CDD, blue = CYP3A Domain 1, orange = CYP3A Domain 2
+exons$fill <- ifelse(exons$exon_num <= 2,               "#D5D8DC",
+                     ifelse(exons$exon_num <= 13,               "#AED6F1",
+                            ifelse(exons$exon_num %in% c(14, 15),      "#D5D8DC",
+                                   "#FAD7A0")))
+
+# ------------------------------------------------------------
+# 9. CDS lookup: nt position → genomic position
+# ------------------------------------------------------------
+cds <- data.frame(
+  start = c(1200981,1201123,1201279,1201497,1201684,1201839,
+            1202072,1202275,1202471,1202662,1202812,1203022,
+            1203255,1203810,1204056,1204215,1204431,1204625,
+            1204798,1205010,1205206,1205404,1205598,1205754,
+            1205963,1206188),
+  end   = c(1201057,1201219,1201428,1201613,1201772,1201990,
+            1202196,1202394,1202602,1202750,1202955,1203184,
+            1203287,1203985,1204152,1204364,1204547,1204713,
+            1204949,1205134,1205325,1205535,1205686,1205897,
+            1206125,1206280)
+)
+
+nt_to_genomic <- c()
+for (i in 1:nrow(cds)) {
+  nt_to_genomic <- c(nt_to_genomic, cds$start[i]:cds$end[i])
+}
+
+aa_to_genomic <- function(aa_pos) {
+  nt_pos <- (aa_pos - 1) * 3 + 1
+  return(nt_to_genomic[nt_pos])
+}
+
+# ------------------------------------------------------------
+# 10. Functional sites (CDD cd11055)
+# ------------------------------------------------------------
+sbp_d1 <- c(79,107,108,109,110,122,123,213,215,216,218,245,
+            312,315,316,320,383,385,494,495)
+sbp_d2 <- c(608,636,637,638,639,651,652,742,744,745,747,774,
+            841,844,845,849,912,914,1023,1024)
+hbs_d1 <- c(107,121,122,129,133,140,313,316,317,320,384,386,
+            447,448,449,450,453,454,455,456,457,461)
+hbs_d2 <- c(636,650,651,658,662,669,842,845,846,849,913,915,
+            976,977,978,979,982,983,984,985,986,990)
+
+sbp_d1_genomic <- sapply(sbp_d1, aa_to_genomic)
+sbp_d2_genomic <- sapply(sbp_d2, aa_to_genomic)
+hbs_d1_genomic <- sapply(hbs_d1, aa_to_genomic)
+hbs_d2_genomic <- sapply(hbs_d2, aa_to_genomic)
+
+residues_to_genomic_ranges <- function(genomic_positions, width = 3) {
+  positions <- sort(unique(genomic_positions))
+  starts <- c(); ends <- c()
+  i <- 1
+  while (i <= length(positions)) {
+    s <- positions[i]; e <- positions[i]
+    while (i < length(positions) && positions[i+1] <= positions[i] + 10) {
+      i <- i + 1; e <- positions[i]
+    }
+    starts <- c(starts, s)
+    ends   <- c(ends, e + width)
+    i <- i + 1
+  }
+  return(data.frame(xmin = starts, xmax = ends))
+}
+
+sbp_rects_g       <- residues_to_genomic_ranges(c(sbp_d1_genomic, sbp_d2_genomic))
+sbp_rects_g$ymin  <- 0.545; sbp_rects_g$ymax <- 0.58
+
+hbs_rects_g       <- residues_to_genomic_ranges(c(hbs_d1_genomic, hbs_d2_genomic))
+hbs_rects_g$ymin  <- 0.42;  hbs_rects_g$ymax <- 0.455
+
+# ------------------------------------------------------------
+# 11. Domain boundaries in genomic space
+# ------------------------------------------------------------
+domain1_start_g <- aa_to_genomic(70)
+domain1_end_g   <- aa_to_genomic(496)
+domain2_start_g <- aa_to_genomic(600)
+domain2_end_g   <- aa_to_genomic(1031)
+
+cat("Domain 1:", domain1_start_g, "-", domain1_end_g, "\n")
+cat("Domain 2:", domain2_start_g, "-", domain2_end_g, "\n")
+
+# ------------------------------------------------------------
+# 12. Variants for Plot 1 (significant missense, with directions)
+# ------------------------------------------------------------
+variants_sig <- missense_sig[, c("aa","POS","direction")]
+names(variants_sig)[2] <- "pos_aa_raw"  # genomic POS, mapped below
+
+# Derive approximate AA position from POS for ordering/labelling
+# (exact conversion via aa_to_genomic is done below)
+variants_sig$genomic_pos <- variants_sig$pos_aa_raw  # already genomic
+
+# Build a proper aa_pos for label ordering using the aa_changes map
+# Extract numeric part of aa label for sorting
+extract_aa_num <- function(aa_str) {
+  as.integer(gsub("[^0-9]", "", regmatches(aa_str,
+                                           regexpr("[0-9]+", aa_str))))
+}
+variants_sig$pos_aa <- sapply(variants_sig$aa, extract_aa_num)
+
+variants_sig$label        <- variants_sig$aa
+variants_sig$y_line_start <- ifelse(variants_sig$direction == "Resistant", 0.58, 0.42)
+variants_sig$y_line_end   <- ifelse(variants_sig$direction == "Resistant", 0.75, 0.25)
+
+
+
+# GWAS SNP positions
+gwas_snps <- data.frame(
+  pos   = c(1200850, 1201004, 1201731, 1201802),
+  label = c("1200850","1201004","1201731","1201802")
+)
+
+# ------------------------------------------------------------
+# 13. merged_box — genotype × BLUP data for Plot 3
+# ------------------------------------------------------------
+
+# Read phenotype (BLUP) file
+pheno <- read.table("new.txt", header = TRUE,
+                    col.names = c("FID","IID","BLUP"))
+
+# Read genotype classes file (no header, two columns: IID and class)
+geno <- read.table("genotype_classes.txt", header = FALSE,
+                   col.names = c("IID","geno_raw"))
+
+# Recode genotype labels to match plot
+geno$Genotype <- dplyr::recode(geno$geno_raw,
+                               "GG_susceptible"  = "G/G",
+                               "GA_heterozygous" = "G/A",
+                               "AA_resistant"    = "A/A"
+)
+
+# Merge on IID
+merged_box <- merge(pheno[, c("IID","BLUP")],
+                    geno[, c("IID","Genotype")],
+                    by = "IID")
+
+# Enforce factor order for plotting
+merged_box$Genotype <- factor(merged_box$Genotype,
+                              levels = c("G/G","G/A","A/A"))
+
+# ------------------------------------------------------------
+# 14. Pairwise Wilcoxon test (Plot 3 significance brackets)
+# ------------------------------------------------------------
+pwc <- pairwise.wilcox.test(merged_box$BLUP,
+                            merged_box$Genotype,
+                            p.adjust.method = "bonferroni")
+print(pwc)
+
+# Convert to ggpubr-compatible format for stat_pvalue_manual
+pwc_tidy <- as.data.frame(as.table(pwc$p.value))
+pwc_tidy <- pwc_tidy[!is.na(pwc_tidy$Freq), ]
+names(pwc_tidy) <- c("group1","group2","p.adj")
+pwc_tidy$p.adj.signif <- ifelse(pwc_tidy$p.adj < 0.001, "***",
+                                ifelse(pwc_tidy$p.adj < 0.01,  "**",
+                                       ifelse(pwc_tidy$p.adj < 0.05,  "*",  "ns")))
+# y-position for brackets (adjust if your BLUP range differs)
+pwc_tidy$y.position <- max(merged_box$BLUP, na.rm = TRUE) *
+  c(1.05, 1.12, 1.19)[seq_len(nrow(pwc_tidy))]
+
+# ============================================================
+# PLOT 1 — Exon/domain/variant map
+# ============================================================
+
+p1 <- ggplot() +
+  # Intron backbone
+  annotate("rect",
+           xmin = 1200981, xmax = 1206280,
+           ymin = 0.49,    ymax = 0.51,
+           fill = "grey60") +
+  # Exon boxes
+  geom_rect(data = exons,
+            aes(xmin = genomic_start, xmax = genomic_end,
+                ymin = 0.42,          ymax = 0.58),
+            fill = "#D5D8DC", colour = "grey40", linewidth = 0.6) +
+  # Exon numbers
+  geom_text(data = exons,
+            aes(x = (genomic_start + genomic_end) / 2, y = 0.50,
+                label = exon_num),
+            size = 5.0, colour = "grey20") +
+  # SBP functional sites
+  geom_rect(data = sbp_rects_g,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "#E41A1C", alpha = 0.9) +
+  # HBS functional sites
+  geom_rect(data = hbs_rects_g,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "#FF7F00", alpha = 0.9) +
+  # Domain boundary dashed lines
+  annotate("segment",
+           x = domain1_start_g, xend = domain1_start_g,
+           y = 0.25, yend = 0.65,
+           linetype = "dashed", colour = "grey20", linewidth = 0.9) +
+  annotate("segment",
+           x = domain1_end_g, xend = domain1_end_g,
+           y = 0.25, yend = 0.65,
+           linetype = "dashed", colour = "grey20", linewidth = 0.9) +
+  annotate("segment",
+           x = domain2_start_g, xend = domain2_start_g,
+           y = 0.25, yend = 0.65,
+           linetype = "dashed", colour = "grey20", linewidth = 0.9) +
+  annotate("segment",
+           x = domain2_end_g, xend = domain2_end_g,
+           y = 0.25, yend = 0.65,
+           linetype = "dashed", colour = "grey20", linewidth = 0.9) +
+  
+  # GWAS SNP positions
+  geom_vline(data = gwas_snps,
+             aes(xintercept = pos),
+             linetype = "dotted", colour = "purple", linewidth = 1.2) +
+  # Variant stems
+  geom_segment(data = variants_sig,
+               aes(x = genomic_pos, xend = genomic_pos,
+                   y = y_line_start, yend = y_line_end,
+                   colour = direction),
+               linewidth = 1.4) +
+  # Variant points
+  geom_point(data = variants_sig,
+             aes(x = genomic_pos, y = y_line_end, colour = direction),
+             size = 4.0) +
+  # Variant labels
+  geom_text_repel(data = variants_sig,
+                  aes(x = genomic_pos, y = y_line_end,
+                      label = label, colour = direction),
+                  size = 6.5,
+                  nudge_x = ifelse(variants_sig$aa == "Asp354Glu", -60,
+                                   ifelse(variants_sig$aa == "Asp355Val",  60, 0)),
+                  nudge_y = ifelse(variants_sig$direction == "Resistant",
+                                   0.10, -0.10),
+                  segment.size = 0.4,
+                  max.overlaps = 20,
+                  show.legend  = FALSE) +
+  scale_colour_manual(values = c("Resistant"   = "firebrick",
+                                 "Susceptible" = "steelblue"),
+                      name = "Missense variant enriched in") +
+  scale_x_continuous(
+    breaks = seq(1200981, 1206280, by = 500),
+    labels = function(x) paste0(round((x - 1200000) / 1000, 1), "kb"),
+    limits = c(1200800, 1206500)) +
+  ylim(0.05, 1.05) +
+  labs(title = "B  Exon-intron structure and functional sites of OUZ56_014667") +
+  theme_classic() +
+  theme(axis.text       = element_blank(),
+        axis.ticks      = element_blank(),
+        axis.title      = element_blank(),
+        axis.line       = element_blank(),
+        plot.title      = element_text(hjust = 0, face = "bold", size = 26),     # was 18
+        legend.position = "none")
+
+print(p1)
+
+# ============================================================
+# PLOT 2 — Allele frequencies of significant variants
+# ============================================================
+
+missense_sig$label  <- missense_sig$aa
+
+missense_sig$max_AF <- pmax(missense_sig$AF_res,
+                            missense_sig$AF_het,
+                            missense_sig$AF_sus,
+                            na.rm = TRUE)
+
+plot_data2 <- pivot_longer(
+  missense_sig[, c("label","POS","AF_res","AF_het","AF_sus",
+                   "diff","stars","max_AF")],
+  cols      = c("AF_res","AF_het","AF_sus"),
+  names_to  = "group",
+  values_to = "AF"
+)
+
+plot_data2$group <- factor(
+  plot_data2$group,
+  levels = c("AF_sus","AF_het","AF_res"),
+  labels = c("Susceptible (G/G)",
+             "Heterozygous (G/A)",
+             "Resistant (A/A)")
+)
+p2 <- ggplot(plot_data2,
+             aes(x = reorder(label, POS), y = AF, fill = group)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  geom_text(data = missense_sig,
+            aes(x = reorder(label, POS),
+                y = max_AF + 0.04, label = stars),
+            inherit.aes = FALSE, size = 11) +                                    # was 9
+  scale_fill_manual(values = c("Resistant (A/A)"   = "firebrick",
+                               "Heterozygous (G/A)"="gold",
+                               "Susceptible (G/G)" = "steelblue")) +
+  scale_y_continuous(limits = c(0, 1.15), breaks = seq(0, 1, 0.2)) +
+  labs(x     = "",
+       y     = "Allele frequency",
+       fill  = "Genotype",
+       title = "C  Missense variant frequencies by genotype group") +
+  theme_classic() +
+  theme(axis.text.x     = element_text(angle = 45, hjust = 1, size = 20),        # was 16
+        axis.text.y     = element_text(size = 20),                               # was 16
+        axis.title.y    = element_text(size = 21),                               # was 17
+        plot.title      = element_text(hjust = 0, face = "bold", size = 26),     # was 18
+        legend.position = "none",
+        legend.text     = element_text(size = 20),                               # was 16
+        legend.title    = element_text(size = 21, face = "bold"))                # was 17
+
+# ============================================================
+# PLOT 3 — Resistance BLUP by genotype
+# ============================================================
+
+p3 <- ggplot(merged_box, aes(x = Genotype, y = BLUP, fill = Genotype)) +
+  geom_boxplot(outlier.shape = 21, alpha = 0.8, width = 0.5) +
+  geom_jitter(width = 0.15, alpha = 0.2, size = 0.8) +
+  stat_pvalue_manual(pwc_tidy,
+                     label       = "p.adj.signif",
+                     tip.length  = 0.01,
+                     size        = 10) +                                          # was 8
+  scale_fill_manual(values = c("steelblue","gold","firebrick")) +
+  scale_x_discrete(labels = c("G/G\nn=39",
+                              "G/A\nn=112",
+                              "A/A\nn=246")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  labs(x     = "",
+       y     = "Chlorpyrifos resistance (BLUP)",
+       title = "A  Resistance by genotype at SNP (1,200,850)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title      = element_text(hjust = 0, face = "bold", size = 26),     # was 18
+        axis.text.x     = element_text(size = 20),                               # was 16
+        axis.text.y     = element_text(size = 20),                               # was 16
+        axis.title.y    = element_text(size = 21))                               # was 17
+
+# ============================================================
+# COMBINE AND SAVE
+# ============================================================
+
+final_plot <- (p3 / p1 / p2) +
+  plot_layout(heights = c(1, 1.4, 1)) +
+  plot_annotation(
+    theme = theme(
+      plot.title    = element_blank(),
+      plot.subtitle = element_blank()
+    )
+  )
+
+ggsave("CYP3A_resistance_figure_v4.pdf",
+       final_plot, width = 14, height = 18, units = "in")
+ggsave("CYP3A_resistance_figure_v4.png",
+       final_plot, width = 14, height = 18, units = "in", dpi = 300)
+
+cat("Saved: CYP3A_resistance_figure_v4.pdf and .png\n")
