@@ -1,0 +1,519 @@
+
+## ============================================================
+##  Combined resistance figure
+##  Panels:
+##    A – Boxplot/dot plot at dose 0.7, ponds ranked by mean survival
+##    B – EMmeans plot (dose 0.7), same ranking & colours
+##    C – Allele-frequency pie charts aligned under each pond
+##    D – Bar plot of the least-resistant clonal line per pond
+## ============================================================
+
+# ── 0. Packages ──────────────────────────────────────────────
+library(tidyverse)
+library(emmeans)
+library(lme4)        # mixed model; swap for glm if preferred
+library(patchwork)
+library(ggforce)     # for geom_sina / beeswarm-style dots
+library(grid)
+library(gtable)
+library(cowplot)
+library(rstatix)
+library(ggpubr)
+
+# ── 1. Load data ──────────────────────────────────────────────
+D1 <- read.csv("D1.csv", stringsAsFactors = FALSE)
+
+# Load genotype files (one clone name per line)
+read_clones <- function(f) trimws(readLines(f))
+AA_clones <- read_clones("AA.txt")   # homozygous resistant
+AG_clones <- read_clones("AG.txt")   # heterozygous
+GG_clones <- read_clones("GG.txt")   # homozygous susceptible
+
+# ── 2. Colour palette ─────────────────────────────────────────
+type_colours <- c(natu = "#4CAF50",   # green  – non-agricultural
+                  agri = "#F44336",   # red    – agricultural
+                  city = "#9E9E9E")   # grey   – urban
+
+type_labels  <- c(natu = "Non-agricultural",
+                  agri = "Agricultural",
+                  city = "Urban")
+
+# ── 3. Prepare survival data ──────────────────────────────────
+D1 <- D1 %>%
+  mutate(
+    survival    = alive / n,
+    pond_code   = trimws(as.character(pond_code)),
+    pond_name   = trimws(as.character(pond_name)),
+    pond_type   = trimws(tolower(as.character(pond_type))),
+    clonal_line = trimws(as.character(clonal_line)),
+    pond_type   = factor(pond_type, levels = c("natu", "agri", "city"))
+  )
+
+# Subset to highest concentration
+D_07 <- D1 %>% filter(dose == 0.7)
+
+# ── 4. Pond ranking (mean survival at 0.7) ────────────────────
+pond_rank <- D_07 %>%
+  group_by(pond_code, pond_type) %>%
+  summarise(
+    mean_surv = mean(survival, na.rm = TRUE),
+    pond_name = first(pond_name),
+    .groups   = "drop"
+  ) %>%
+  group_by(pond_code) %>%
+  slice_max(mean_surv, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(mean_surv) %>%
+  mutate(pond_order = row_number())
+
+stopifnot("Duplicate pond_codes remain after deduplication – check your data" =
+            !anyDuplicated(pond_rank$pond_code))
+
+pond_levels <- pond_rank$pond_code
+
+D_07 <- D_07 %>%
+  mutate(pond_code = factor(pond_code, levels = pond_levels))
+
+pond_rank <- pond_rank %>%
+  mutate(pond_code = factor(pond_code, levels = pond_levels))
+
+# ── 5. Mixed model & EMmeans ──────────────────────────────────
+library(glmmTMB)
+
+check_levels <- function(data, vars) {
+  for (v in vars) {
+    n <- length(unique(data[[v]]))
+    cat(sprintf("  %-20s : %d level(s) -> %s\n", v, n,
+                if (n < 2) "*** PROBLEM ***" else "OK"))
+  }
+}
+cat("\n── Level check for fixed effects in D_07 ──\n")
+check_levels(D_07, c("treatment", "pond_code"))
+cat("── Level check for random effects in D_07 ──\n")
+check_levels(D_07, c("clone_code", "date", "observer"))
+cat("\n")
+
+D_07 <- D_07 %>%
+  mutate(across(where(is.factor), droplevels),
+         obs_id = factor(seq_len(n())))
+
+n_treatment <- length(unique(D_07$treatment))
+
+formula_m1 <- if (n_treatment >= 2) {
+  cbind(alive, dead) ~ treatment * pond_code +
+    (1 | clone_code) + (1 | date) + (1 | observer) + (1 | obs_id)
+} else {
+  message("NOTE: only 1 treatment level at dose 0.7 – fitting without 'treatment' term.")
+  cbind(alive, dead) ~ pond_code +
+    (1 | clone_code) + (1 | date) + (1 | observer) + (1 | obs_id)
+}
+
+model_data <<- as.data.frame(D_07)
+
+m1 <- glmmTMB(
+  formula = formula_m1,
+  family  = binomial(link = "logit"),
+  data    = model_data
+)
+
+rg   <- ref_grid(m1, data = model_data)
+em   <- emmeans(rg, ~ pond_code, type = "response")
+
+em_df <- as.data.frame(em) %>%
+  rename(emmean = prob, lower = asymp.LCL, upper = asymp.UCL) %>%
+  mutate(pond_code = as.character(pond_code)) %>%
+  left_join(pond_rank %>% select(pond_code, pond_type), by = "pond_code")
+
+pond_levels <- em_df %>%
+  arrange(emmean) %>%
+  pull(pond_code) %>%
+  as.character()
+
+pond_rank <- pond_rank %>%
+  mutate(pond_code = factor(pond_code, levels = pond_levels)) %>%
+  arrange(pond_code)
+
+em_df <- em_df %>%
+  mutate(pond_code = factor(pond_code, levels = pond_levels))
+
+D_07 <- D_07 %>%
+  mutate(pond_code = factor(as.character(pond_code), levels = pond_levels))
+
+# ── 6. Least-resistant clonal line per pond ───────────────────
+clone_rank <- D_07 %>%
+  group_by(pond_code, clone_code, pond_type) %>%
+  summarise(mean_surv = mean(survival, na.rm = TRUE), .groups = "drop")
+
+least_resistant <- clone_rank %>%
+  group_by(pond_code) %>%
+  slice_min(mean_surv, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(pond_code = factor(pond_code, levels = pond_levels))
+
+model_data_clone <<- as.data.frame(D_07)
+
+m2 <- glmmTMB(
+  cbind(alive, dead) ~ clone_code +
+    (1 | pond_code) + (1 | date) + (1 | observer) + (1 | obs_id),
+  family = binomial(link = "logit"),
+  data   = model_data_clone
+)
+
+rg2  <- ref_grid(m2, data = model_data_clone)
+em2  <- emmeans(rg2, ~ clone_code, type = "response")
+
+em2_df <- as.data.frame(em2) %>%
+  rename(emmean = prob, lower = asymp.LCL, upper = asymp.UCL) %>%
+  mutate(clone_code = as.character(clone_code))
+
+least_resistant_em <- least_resistant %>%
+  left_join(em2_df, by = "clone_code")
+
+# ── 7. Allele frequency per pond ─────────────────────────────
+genotype_df <- tibble(
+  clone_name = trimws(c(AA_clones, AG_clones, GG_clones)),
+  genotype   = c(rep("AA", length(AA_clones)),
+                 rep("AG", length(AG_clones)),
+                 rep("GG", length(GG_clones)))
+)
+
+txt_names   <- genotype_df$clone_name
+match_clone <- sum(trimws(as.character(D1$clone_code))   %in% txt_names)
+match_line  <- sum(trimws(as.character(D1$clonal_line))  %in% txt_names)
+
+cat(sprintf("\nGenotype join diagnostic:\n"))
+cat(sprintf("  Matches via clone_code  : %d / %d txt names\n", match_clone, length(txt_names)))
+cat(sprintf("  Matches via clonal_line : %d / %d txt names\n", match_line,  length(txt_names)))
+
+join_col <- if (match_clone >= match_line) "clone_code" else "clonal_line"
+cat(sprintf("  → using column '%s' for genotype join\n\n", join_col))
+
+clone_pond <- D1 %>%
+  transmute(clone_name = trimws(as.character(.data[[join_col]])),
+            pond_code  = pond_code) %>%
+  distinct()
+
+geno_pond <- genotype_df %>%
+  left_join(clone_pond, by = "clone_name") %>%
+  filter(!is.na(pond_code)) %>%
+  mutate(pond_code = factor(as.character(pond_code), levels = pond_levels))
+
+cat(sprintf("Genotype rows matched to a pond: %d / %d\n\n", nrow(geno_pond), nrow(genotype_df)))
+
+allele_freq <- geno_pond %>%
+  group_by(pond_code) %>%
+  summarise(
+    n_clones  = n(),
+    A_alleles = sum(genotype == "AA") * 2 + sum(genotype == "AG"),
+    G_alleles = sum(genotype == "GG") * 2 + sum(genotype == "AG"),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    total     = A_alleles + G_alleles,
+    freq_A    = A_alleles / total,
+    freq_G    = G_alleles / total,
+    pond_code = factor(as.character(pond_code), levels = pond_levels)
+  )
+
+all_ponds_af <- pond_rank %>%
+  select(pond_code) %>%
+  left_join(allele_freq, by = "pond_code") %>%
+  replace_na(list(freq_A = NA_real_, freq_G = NA_real_, n_clones = 0))
+
+cat(sprintf("Ponds with genotype data : %d / %d\n\n",
+            sum(!is.na(all_ponds_af$freq_A)), nrow(all_ponds_af)))
+
+# ── 8. PANEL A – Raw survival counts boxplot + dots ──────────
+pA <- ggplot(D_07,
+             aes(x      = pond_code,
+                 y      = alive,
+                 fill   = pond_type,
+                 colour = pond_type)) +
+  geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5,
+               colour = "grey30") +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.75, shape = 16) +
+  scale_fill_manual(values = type_colours, labels = type_labels,
+                    name = "Pond type") +
+  scale_colour_manual(values = type_colours, labels = type_labels,
+                      name = "Pond type") +
+  scale_y_continuous(limits = c(0, 10), breaks = 0:10) +
+  labs(
+    title = "A  Raw survival counts at 0.7 µg/L CPF",   # removed "."
+    x     = NULL,
+    y     = "Number alive (out of 10)"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title      = element_text(size = 26, face = "bold"),   # was 19
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 20),  # was 16
+    axis.text.y     = element_text(size = 20),                  # was 16
+    axis.title.y    = element_text(size = 21),                  # was 17
+    legend.text     = element_text(size = 20),                  # was 16
+    legend.title    = element_text(size = 21),                  # was 17
+    legend.position = "top"
+  )
+
+# ── 9. PANEL B – EMmeans plot ─────────────────────────────────
+em_df_plot <- em_df %>% filter(!is.na(emmean))
+
+ref_pond <- as.character(em_df_plot$pond_code[which.min(em_df_plot$emmean)])
+cat(sprintf("\nPanel B reference pond (least resistant): %s\n", ref_pond))
+
+pB_pairs <- as_tibble(pairs(em, adjust = "BH")) %>%
+  mutate(
+    pond1 = trimws(sub(" / .*", "", contrast)),
+    pond2 = trimws(sub(".* / ", "", contrast))
+  )
+
+pB_vs_ref <- bind_rows(
+  pB_pairs %>% filter(pond1 == ref_pond) %>% rename(focal = pond2),
+  pB_pairs %>% filter(pond2 == ref_pond) %>% rename(focal = pond1)
+) %>%
+  mutate(
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ ""
+    ),
+    pond_code = factor(focal, levels = pond_levels)
+  ) %>%
+  select(pond_code, sig, p.value)
+
+em_df_plot <- em_df_plot %>%
+  left_join(pB_vs_ref, by = "pond_code") %>%
+  mutate(sig = ifelse(as.character(pond_code) == ref_pond, "", replace_na(sig, "")))
+
+y_max <- max(em_df_plot$upper, na.rm = TRUE)
+
+pB <- ggplot(em_df_plot,
+             aes(x = pond_code, y = emmean,
+                 colour = pond_type, fill = pond_type)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.25, linewidth = 0.8) +
+  geom_point(size = 4, shape = 21, colour = "grey20") +
+  geom_text(aes(y = upper + 0.02, label = sig),
+            colour = "grey20", size = 7, vjust = 0) +   # was 5.5
+  scale_fill_manual(values = type_colours, labels = type_labels,
+                    name = "Pond type") +
+  scale_colour_manual(values = type_colours, labels = type_labels,
+                      name = "Pond type") +
+  scale_y_continuous(limits = c(0, y_max + 0.12),
+                     labels = scales::percent_format()) +
+  labs(
+    title = "B  Model-estimated survival probability (EMmeans ± 95% CI)",  # removed "." and subtitle
+    x     = NULL,
+    y     = "Estimated survival probability"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title      = element_text(size = 26, face = "bold"),   # was 19
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 20),  # was 16
+    axis.text.y     = element_text(size = 20),                  # was 16
+    axis.title.y    = element_text(size = 21),                  # was 17
+    legend.position = "none"
+  )
+
+# ── 10. PANEL C – Pie charts (one per pond) ───────────────────
+make_pie <- function(pond, freq_a, freq_g) {
+  if (is.na(freq_a) || is.na(freq_g)) {
+    df <- tibble(allele = factor("No data"), freq = 1)
+    return(
+      ggplot(df, aes(x = "", y = freq, fill = allele)) +
+        geom_col(width = 1, colour = "white") +
+        coord_polar("y") +
+        scale_fill_manual(values = c("No data" = "#BDBDBD"),
+                          drop = FALSE) +
+        labs(title = as.character(pond), subtitle = "no data") +
+        theme_void(base_size = 15) +
+        theme(plot.title       = element_text(hjust = 0.5, size = 15, face = "bold"),
+              plot.subtitle    = element_text(hjust = 0.5, size = 13, colour = "grey50"),
+              plot.margin      = margin(t = 18, r = 2, b = 2, l = 2),
+              plot.background  = element_rect(fill = "white", colour = NA),
+              panel.background = element_rect(fill = "white", colour = NA),
+              legend.position  = "none")
+    )
+  }
+  df <- tibble(
+    allele = factor(c("A – resistant", "G – susceptible"),
+                    levels = c("A – resistant", "G – susceptible")),
+    freq   = c(freq_a, freq_g)
+  )
+  ggplot(df, aes(x = "", y = freq, fill = allele)) +
+    geom_col(width = 1, colour = "white", linewidth = 0.4) +
+    coord_polar("y") +
+    scale_fill_manual(
+      values = c("A – resistant"   = "#1565C0",
+                 "G – susceptible" = "#E0E0E0"),
+      name   = "Allele"
+    ) +
+    labs(title = as.character(pond)) +
+    theme_void(base_size = 15) +
+    theme(
+      plot.title       = element_text(hjust = 0.5, size = 15, face = "bold"),
+      plot.margin      = margin(t = 18, r = 2, b = 2, l = 2),
+      plot.background  = element_rect(fill = "white", colour = NA),
+      panel.background = element_rect(fill = "white", colour = NA),
+      legend.position  = "none"
+    )
+}
+
+pie_list <- pmap(
+  list(as.character(all_ponds_af$pond_code),
+       all_ponds_af$freq_A,
+       all_ponds_af$freq_G),
+  make_pie
+)
+
+# Shared legend from a dummy pie
+legend_pie_data <- tibble(
+  allele = factor(c("A – resistant", "G – susceptible"),
+                  levels = c("A – resistant", "G – susceptible")),
+  freq   = c(0.5, 0.5)
+)
+legend_grob <- cowplot::get_legend(
+  ggplot(legend_pie_data, aes(x = "", y = freq, fill = allele)) +
+    geom_col(width = 1) +
+    coord_polar("y") +
+    scale_fill_manual(
+      values = c("A – resistant"   = "#1565C0",
+                 "G – susceptible" = "#E0E0E0"),
+      name   = "Allele"
+    ) +
+    theme_void(base_size = 14) +
+    theme(
+      legend.direction = "horizontal",
+      legend.text      = element_text(size = 20),    # was 17
+      legend.title     = element_text(size = 21, face = "bold"),  # was 18
+      legend.key.size  = unit(1, "cm")
+    )
+)
+
+if (length(pie_list) == 0) {
+  pC <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5,
+             label = "No genotype data matched to ponds.\nCheck clone names in AA/AG/GG.txt vs clone_code/clonal_line in D1.csv.",
+             hjust = 0.5, vjust = 0.5, size = 7, colour = "grey40") +  # was 5
+    theme_void()
+} else {
+  pies_row <- wrap_plots(pie_list, nrow = 1)
+  pC <- cowplot::plot_grid(
+    pies_row,
+    legend_grob,
+    ncol        = 1,
+    rel_heights = c(1, 0.18)
+  )
+  pC <- pC + theme(plot.background = element_rect(fill = "white", colour = NA))
+}
+
+# ── 11. PANEL D – Mean survival per pond type with significance brackets ──
+library(rstatix)
+library(ggpubr)
+
+pD_pond_means <- D1 %>%
+  filter(dose == 0.7, !is.na(alive), !is.na(n), n > 0) %>%
+  mutate(surv      = alive / n,
+         pond_type = factor(trimws(tolower(pond_type)),
+                            levels = c("agri", "city", "natu"))) %>%
+  group_by(pond_code, pond_type) %>%
+  summarise(mean_surv = mean(surv, na.rm = TRUE), .groups = "drop")
+
+pD_stats <- pD_pond_means %>%
+  wilcox_test(mean_surv ~ pond_type, p.adjust.method = "BH") %>%
+  add_significance(p.col = "p.adj") %>%
+  mutate(p.adj.signif = case_when(
+    p.adj < 0.001 ~ "***",
+    p.adj < 0.01  ~ "**",
+    p.adj < 0.05  ~ "*",
+    TRUE          ~ "ns"
+  )) %>%
+  add_xy_position(x = "pond_type", dodge = 0)
+
+pD <- ggplot(pD_pond_means,
+             aes(x = pond_type, y = mean_surv, fill = pond_type)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = NA, width = 0.5,
+               colour = "grey20") +
+  geom_jitter(width = 0.12, size = 3, alpha = 0.8,
+              colour = "grey30", shape = 16) +
+  stat_pvalue_manual(pD_stats,
+                     label           = "p.adj.signif",
+                     tip.length      = 0.01,
+                     bracket.nudge.y = 0.02,
+                     size            = 8) +    # was 6
+  scale_fill_manual(values = type_colours, labels = type_labels,
+                    name = "Pond type") +
+  scale_x_discrete(labels = type_labels) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     expand = expansion(mult = c(0.05, 0.12))) +
+  labs(
+    title = "D  Mean survival rate by pond type (dose 0.7 µg/L CPF)",  # removed "."
+    x     = NULL,
+    y     = "Mean survival rate"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title      = element_text(size = 26, face = "bold"),   # was 19
+    axis.text.x     = element_text(size = 20),                  # was 17
+    axis.text.y     = element_text(size = 20),                  # was 16
+    axis.title.y    = element_text(size = 21),                  # was 17
+    legend.position = "none"
+  )
+
+# ── 12. Combine all panels ────────────────────────────────────
+library(cowplot)
+
+top3 <- (pA / pB) +
+  plot_layout(heights = c(1, 1))
+
+pC_titled <- cowplot::plot_grid(
+  cowplot::ggdraw() +
+    cowplot::draw_label(
+      "C  Frequency of resistance allele A per pond",
+      fontface = "bold", size = 26, x = 0, hjust = 0
+    ),
+  pC,
+  ncol = 1,
+  rel_heights = c(0.18, 1)
+)
+
+combined <- cowplot::plot_grid(
+  pA, pB, pC_titled, pD,
+  ncol         = 1,
+  rel_heights  = c(3.5, 3.5, 2, 3.5),
+  align        = "v",
+  axis         = "lr"
+)
+
+combined <- combined +
+  theme(plot.background = element_rect(fill = "white", colour = NA))
+
+# ── 13. Save ──────────────────────────────────────────────────
+tmp_pdf <- file.path(tempdir(), "resistance_combined.pdf")
+tmp_png <- file.path(tempdir(), "resistance_combined.png")
+
+ggsave(tmp_pdf,
+       plot   = combined,
+       width  = 14,
+       height = 22,
+       units  = "in",
+       device = "pdf")
+
+ggsave(tmp_png,
+       plot   = combined,
+       width  = 14,
+       height = 22,
+       units  = "in",
+       dpi    = 300,
+       device = "png")
+
+out_dir <- "D:/resistance_figures"   # <-- change if needed
+
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+pdf_path <- file.path(out_dir, "resistance_combined.pdf")
+png_path <- file.path(out_dir, "resistance_combined.png")
+
+file.copy(tmp_pdf, pdf_path, overwrite = TRUE)
+file.copy(tmp_png, png_path, overwrite = TRUE)
+
+message(sprintf("Done!\n  PDF: %s\n  PNG: %s", pdf_path, png_path))
