@@ -1,0 +1,26 @@
+#!/bin/bash -l
+#SBATCH --cluster=genius
+#SBATCH --job-name cleaning
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=20
+#SBATCH --time=01:00:00
+#SBATCH -A lp_
+
+module load BCFtools/1.18-GCC-12.3.0
+bcftools view -h Merged.vcf.gz | \
+awk '
+BEGIN { OFS="\t" }
+/^#CHROM/ {
+  for (i=10; i<=NF; i++) {
+    # Example: D5_BW_22050_C21_aligned.sorted.nd.bam
+    if (match($i, /^([A-Za-z0-9]{2}).*C([0-9]+)/, a)) {
+      $i = a[1] "_C" a[2]
+    }
+  }
+}
+{ print }
+' > new_header.txt
+bcftools reheader -h new_header.txt -o Merged_clean.vcf.gz Merged.vcf.gz
+bcftools index Merged_clean.vcf.gz
+bcftools query -l Merged_clean.vcf.gz | head
+echo 'done'
