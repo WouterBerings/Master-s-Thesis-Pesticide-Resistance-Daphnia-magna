@@ -1,0 +1,100 @@
+library(glmmTMB)
+library(dplyr)
+
+D=read.csv('D1.csv')
+getwd()
+str(D)
+df <- D |> dplyr::mutate(across(where(is.character), as.factor))
+df <- df %>% mutate(obs_id = factor(row_number()))
+
+
+model_bb <- glmmTMB(cbind(alive, dead) ~ treatment * pond_code +
+                      (1 | clone_code) + (1 | date) + (1 | observer) + (1 | obs_id),
+                    family = binomial(link = "logit"), data = df)
+blups <- ranef(model_bb)$cond$clone_code
+
+
+# 1. Check overdispersion — obs_id as OLRE is good, confirm it's absorbing it
+summary(model_bb)
+
+# Extract variance components
+vc <- VarCorr(model_bb)
+print(vc)
+
+library(data.table)
+
+gwas <- fread("results.assoc.txt")
+
+# Create matching chr:pos ID
+gwas[, snp_id := paste0(chr, ":", ps)]
+
+# Write new results file with ID column for PLINK
+fwrite(gwas[, .(snp_id, p_wald)], 
+       "results_with_ids.txt", 
+       sep = "\t")
+
+# Also write the full file with new IDs
+fwrite(gwas, "results_ids.assoc.txt", sep = "\t")
+
+library(data.table)
+library(glmmTMB)
+library(dplyr)
+
+# ── Variance components from your BLUP model ──────────────────────────────────
+vc       <- VarCorr(model_bb)$cond
+V_clone  <- as.numeric(vc$clone_code)
+V_date   <- as.numeric(vc$date)
+V_obs    <- as.numeric(vc$observer)
+V_olre   <- as.numeric(vc$obs_id)
+V_binom  <- pi^2 / 3
+
+V_P_latent <- V_clone + V_date + V_obs + V_olre + V_binom
+
+# ── Load GWAS results ─────────────────────────────────────────────────────────
+gwas <- fread("results.assoc.txt")
+
+# ── Filter and compute variance explained ─────────────────────────────────────
+gwas <- gwas %>%
+  filter(n_miss == 0) %>%                          # complete SNPs only
+  mutate(
+    MAF   = ifelse(af > 0.5, 1 - af, af),
+    V_SNP = 2 * beta^2 * MAF * (1 - MAF),
+    r2_Vg = V_SNP / V_clone,                       # % of clonal/genetic variance
+    r2_Vp = V_SNP / V_P_latent                     # % of total latent variance
+  )
+
+# ── Top hits ──────────────────────────────────────────────────────────────────
+gwas %>%
+  filter(MAF >= 0.05) %>%                          # exclude rare variants
+  arrange(p_wald) %>%
+  select(chr, ps, allele1, allele0, MAF, beta, se, p_wald, V_SNP, r2_Vg, r2_Vp) %>%
+  head(20)
+
+library(data.table)
+
+# Load the LD matrix
+ld <- as.matrix(fread("scaffold5_LD.ld", header = FALSE))
+
+# Check dimensions
+dim(ld)  # should be 490 x 490
+
+# Load bim — try these alternative names
+list.files(pattern = "*.bim")  # see what bim files exist
+
+bim <- fread("scaffold5_LD.bim")
+print(head(bim))        # see what columns look like
+print(dim(bim))         # should have 490 rows
+positions <- bim$V4     # V4 is bp position
+
+top4_pos <- c(1200850, 1201004, 1201731, 1201802)
+idx <- which(positions %in% top4_pos)
+print(idx)              # should give 4 numbers — if empty, positions don't match
+print(positions[idx])   # confirm they're the right ones
+
+
+# Extract the 4x4 submatrix
+ld_top4 <- ld[idx, idx]
+rownames(ld_top4) <- top4_pos
+colnames(ld_top4) <- top4_pos
+
+print(round(ld_top4, 3))
