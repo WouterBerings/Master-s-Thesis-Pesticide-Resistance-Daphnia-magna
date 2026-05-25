@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+module load cluster/genius/batch
+module load BCFtools/1.18-GCC-12.3.0
+module load PLINK/2.0.0-a.6.9-gfbf-2024a
+
+INPUT_VCF="batch1234_DmagnaLRV01_merged1_10.vcf.gz"
+OUT_PREFIX="/lustre1/scratch/385/vsc38531/FILTER/15,8,500,.2"
+
+# --- Thresholds ---
+GQ_MIN=15
+DP_MIN=8
+DP_MAX=500        # CHANGED: raised from 200; less aggressive depth ceiling
+
+
+MISS_MAX=0.20     # CHANGED: tightened from 0.50 � fewer variants lost to bad samples
+
+# =============================================================================
+# STEP 1: Early biallelic SNP filter � REMOVED the -f PASS,. filter
+# Rationale: soft-filtered sites may still have good genotypes after
+# genotype-level masking. Let GQ/DP decide, not the FILTER column.
+# =============================================================================
+echo "=== STEP 1: Early biallelic SNP filter ==="
+
+BIALLELIC_VCF="${OUT_PREFIX}.biallelic_snps.vcf.gz"
+
+bcftools view \
+  --threads 10 \
+  -m2 -M2 \
+  -v snps \
+  -O z -o "${BIALLELIC_VCF}" \
+  "${INPUT_VCF}"
+
+bcftools index --tbi "${BIALLELIC_VCF}"
+
+N_BEFORE=$(bcftools stats "${BIALLELIC_VCF}" | grep "^SN" | grep "number of SNPs" | cut -f4)
+echo "Biallelic SNPs entering pipeline: ${N_BEFORE}"
+
+# =============================================================================
+# STEP 2: Genotype-level masking (unchanged in logic)
+# =============================================================================
+echo ""
+echo "=== STEP 2: Genotype-level masking ==="
+
+GENO_FILTERED="${OUT_PREFIX}.geno_filtered.vcf.gz"
+
+bcftools +setGT \
+  --threads 10 \
+  "${BIALLELIC_VCF}" \
+  -O z -o "${GENO_FILTERED}" \
+  -- \
+  -t q \
+  -n . \
+  -i "FMT/GQ < ${GQ_MIN} || FMT/DP < ${DP_MIN} || FMT/DP > ${DP_MAX}"
+
+bcftools index --tbi "${GENO_FILTERED}"
+
+echo "Genotype-level masking complete: ${GENO_FILTERED}"
+
+# =============================================================================
+# STEP 3: Convert to PLINK2
+# =============================================================================
+echo ""
+echo "=== STEP 3: Converting to PLINK2 format ==="
+
+plink2 \
+  --vcf "${GENO_FILTERED}" \
+  --double-id \
+  --vcf-half-call missing \
+  --make-pgen \
+  --out "${OUT_PREFIX}.plink" \
+  --threads 10
+
+
+# =============================================================================
+# STEP 4b: Variant-level missingness (now applied to cleaner sample set)
+# =============================================================================
+echo ""
+echo "=== STEP 4b: Variant-level filters (missingness) ==="
+
+plink2 \
+  --pfile "${OUT_PREFIX}.plink" \
+  --geno "${MISS_MAX}" \
+  --make-pgen \
+  --out "${OUT_PREFIX}.filtered" \
+  --threads 10
+
+# =============================================================================
+# STEP 5: Export final filtered VCF
+# =============================================================================
+echo ""
+echo "=== STEP 5: Exporting filtered VCF ==="
+
+plink2 \
+  --pfile "${OUT_PREFIX}.filtered" \
+  --export vcf bgz \
+  --out "${OUT_PREFIX}.final" \
+  --threads 10
+
+bcftools index --tbi "${OUT_PREFIX}.final.vcf.gz"
+
+# =============================================================================
+# STEP 6: Summary
+# =============================================================================
+echo ""
+echo "=== STEP 6: Filter summary ==="
+
+N_AFTER=$(bcftools stats "${OUT_PREFIX}.final.vcf.gz" | grep "^SN" | grep "number of SNPs" | cut -f4)
+N_SAMPLES=$(bcftools query -l "${OUT_PREFIX}.final.vcf.gz" | wc -l)
+
+echo "----------------------------------------"
+echo "  SNPs before filtering : ${N_BEFORE}"
+echo "  SNPs after filtering  : ${N_AFTER}"
+echo "  Samples retained      : ${N_SAMPLES}"
+echo "  Final VCF             : ${OUT_PREFIX}.final.vcf.gz"
+echo "----------------------------------------"
+
+bcftools stats "${OUT_PREFIX}.final.vcf.gz" > "${OUT_PREFIX}.final.stats.txt"
+echo "Full stats written to: ${OUT_PREFIX}.final.stats.txt"
+
+echo ""
+echo "=== Pipeline complete ==="
